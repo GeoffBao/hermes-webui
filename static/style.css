@@ -715,6 +715,14 @@
   .role-icon{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;}
   .role-icon.user{background:var(--accent-bg);color:var(--accent-text);border:1px solid var(--accent-bg-strong);}
   .role-icon.assistant{background:var(--accent-bg-strong);color:var(--accent-text);border:1px solid var(--accent-bg-strong);}
+  .assistant-avatar{overflow:hidden;background:var(--surface);}
+  .assistant-avatar-img{width:100%;height:100%;display:block;object-fit:cover;}
+  .assistant-avatar-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
+  .assistant-avatar-fallback[hidden]{display:none;}
+  .user-avatar{overflow:hidden;background:var(--surface);}
+  .user-avatar-img{width:100%;height:100%;display:block;object-fit:cover;}
+  .user-avatar-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
+  .user-avatar-fallback[hidden]{display:none;}
   .msg-body{font-size:14px;line-height:1.75;color:var(--text);padding-left:30px;max-width:680px;overflow-wrap:anywhere;}
   .msg-body p{margin-bottom:10px;}.msg-body p:last-child{margin-bottom:0;}
   .msg-body ul,.msg-body ol{margin:6px 0 10px 20px;}.msg-body li{margin-bottom:3px;}
@@ -2362,7 +2370,8 @@ main.main.showing-profiles > #mainProfiles{display:flex;}
 .msg-row:hover .msg-actions { opacity: 1; }
 .assistant-turn:hover .msg-actions { opacity: 1; }
 
-/* ── User message: right-aligned bubble; no avatar/label — position identifies sender ── */
+/* ── User message: right-aligned bubble + role row (avatar) ── */
+.msg-row[data-role="user"] .msg-role.user{width:100%;justify-content:flex-end;}
 .msg-row[data-role="user"] .msg-body {
   background: var(--user-bubble-bg);
   border: 1px solid var(--user-bubble-border);

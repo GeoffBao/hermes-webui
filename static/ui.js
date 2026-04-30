@@ -2405,7 +2405,13 @@ function _messageHasReasoningPayload(m){
 }
 function _assistantRoleHtml(tsTitle=''){
   const _bn=window._botName||'Hermes';
-  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span style="font-size:12px">${esc(_bn)}</span></div>`;
+  const initial=esc(_bn.charAt(0).toUpperCase());
+  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant assistant-avatar"><img class="assistant-avatar-img" src="/static/hermes-agent-avatar.png" alt="" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span class="assistant-avatar-fallback" hidden>${initial}</span></div><span style="font-size:12px">${esc(_bn)}</span></div>`;
+}
+function _userRoleHtml(tsTitle=''){
+  const label=typeof t==='function'?t('you'):'You';
+  const initial=esc(String(label).charAt(0).toUpperCase());
+  return `<div class="msg-role user" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon user user-avatar"><img class="user-avatar-img" src="/static/user-avatar.png" alt="" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span class="user-avatar-fallback" hidden>${initial}</span></div><span style="font-size:12px">${esc(label)}</span></div>`;
 }
 function _createAssistantTurn(tsTitle=''){
   const row=document.createElement('div');
@@ -2906,7 +2912,7 @@ function renderMessages(){
       row.dataset.msgIdx=rawIdx;
       row.dataset.role='user';
       row.dataset.rawText=String(content).trim();
-      row.innerHTML=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
+      row.innerHTML=`${_userRoleHtml(tsTitle)}${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
       inner.appendChild(row);
       userRows.set(rawIdx, row);
       continue;

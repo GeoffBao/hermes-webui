@@ -15,6 +15,7 @@ async function cancelStream(){
 
 // ── Mobile navigation ──────────────────────────────────────────────────────
 let _workspacePanelMode='closed'; // 'closed' | 'browse' | 'preview'
+let _sidebarPanelMode='open'; // 'open' | 'closed'
 
 function _isCompactWorkspaceViewport(){
   return window.matchMedia('(max-width: 900px)').matches;
@@ -44,6 +45,39 @@ function _workspacePanelEls(){
     toggleBtn: $('btnWorkspacePanelToggle'),
     collapseBtn: $('btnCollapseWorkspacePanel'),
   };
+}
+
+function _syncSidebarPanelUI(){
+  const toggleBtn=$('btnSidebarPanelToggle');
+  const isOpen=_sidebarPanelMode==='open';
+  document.documentElement.dataset.sidebarPanel=isOpen?'open':'closed';
+  if(toggleBtn){
+    toggleBtn.setAttribute('aria-pressed',isOpen?'true':'false');
+    toggleBtn.title=isOpen?'Hide chat panel':'Show chat panel';
+    toggleBtn.classList.toggle('active',!isOpen);
+  }
+}
+
+function _setSidebarPanelMode(mode){
+  const layout=document.querySelector('.layout');
+  const next=mode==='closed'?'closed':'open';
+  _sidebarPanelMode=next;
+  if(layout){
+    layout.classList.toggle('sidebar-panel-collapsed',next==='closed');
+  }
+  localStorage.setItem('hermes-webui-sidebar-panel',next);
+  _syncSidebarPanelUI();
+}
+
+function toggleSidebarPanel(force){
+  const isCompact=_isCompactWorkspaceViewport();
+  if(isCompact){
+    toggleMobileSidebar();
+    return;
+  }
+  const currentlyOpen=_sidebarPanelMode==='open';
+  const shouldOpen=typeof force==='boolean'?force:!currentlyOpen;
+  _setSidebarPanelMode(shouldOpen?'open':'closed');
 }
 
 function _hasWorkspacePreviewVisible(){
@@ -532,11 +566,24 @@ $('msg').addEventListener('keydown',e=>{
 });
 // B14: Cmd/Ctrl+K creates a new chat from anywhere
 document.addEventListener('keydown',async e=>{
+  const tag=(document.activeElement||{}).tagName||'';
+  const typingContext=tag==='TEXTAREA'||tag==='INPUT'||tag==='SELECT'||(document.activeElement&&document.activeElement.isContentEditable);
+  if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&!e.altKey&&!typingContext){
+    if(e.key==='\\'){
+      e.preventDefault();
+      toggleSidebarPanel();
+      return;
+    }
+    if(e.key===']'){
+      e.preventDefault();
+      toggleWorkspacePanel();
+      return;
+    }
+  }
   // Enter on approval card = Allow once (when a button inside the card is focused or
   // card is visible and focus is not on an input/textarea/select)
   if(e.key==='Enter'&&!e.metaKey&&!e.ctrlKey&&!e.shiftKey){
     const card=$('approvalCard');
-    const tag=(document.activeElement||{}).tagName||'';
     if(card&&card.classList.contains('visible')&&tag!=='TEXTAREA'&&tag!=='INPUT'&&tag!=='SELECT'){
       e.preventDefault();
       if(typeof respondApproval==='function') respondApproval('once');
@@ -592,6 +639,7 @@ document.querySelectorAll('.suggestion').forEach(btn=>{
 window.addEventListener('resize',()=>{
   _syncWorkspacePanelInlineWidth();
   syncWorkspacePanelState();
+  _syncSidebarPanelUI();
 });
 
 // Boot: restore last session or start fresh
@@ -661,7 +709,9 @@ const _SKINS=[
   {name:'Poseidon', colors:['#0EA5E9','#0284C7','#0369A1']},
   {name:'Sisyphus', colors:['#A78BFA','#8B5CF6','#7C3AED']},
   {name:'Charizard',colors:['#FB923C','#F97316','#EA580C']},
-  {name:'Claude',   colors:['#D97757','#C06A49','#9A523A']},
+  {name:'Sienna',   colors:['#D97757','#C06A49','#9A523A']},
+  {name:'Claude',   colors:['#D97757','#E5D8C7','#2E2A24']},
+  {name:'Nebula',   colors:['#22D3EE','#3B82F6','#8B5CF6']},
 ];
 const _VALID_THEMES=new Set((_THEMES||[]).map(t=>t.value));
 const _VALID_SKINS=new Set((_SKINS||[]).map(s=>s.name.toLowerCase()));
@@ -921,6 +971,7 @@ function applyBotName(){
   await loadWorkspaceList();
   await loadOnboardingWizard();
   await renderSessionList();
+  _setSidebarPanelMode(localStorage.getItem('hermes-webui-sidebar-panel')==='closed'?'closed':'open');
   _initResizePanels();
   // Workspace panel restore happens AFTER loadSession so we know if
   // the session has a workspace — prevents the snap-open-then-closed flash (#576).

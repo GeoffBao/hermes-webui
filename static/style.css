@@ -178,6 +178,36 @@
   :root[data-skin="claude"] .send-btn:hover{box-shadow:0 2px 8px rgba(217,119,87,0.45);}
   /* Sidebar active session: use accent tint so it matches the Claude list item look */
   :root[data-skin="claude"] .session-item.active{border-left:2px solid var(--accent);}
+  /* Sienna-specific affordances */
+  :root[data-skin="sienna"]:not(.dark) .new-chat-btn,
+  :root.dark[data-skin="sienna"] .new-chat-btn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;box-shadow:0 1px 2px rgba(20,19,17,0.08);}
+  :root[data-skin="sienna"]:not(.dark) .new-chat-btn:hover,
+  :root.dark[data-skin="sienna"] .new-chat-btn:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff;}
+  :root[data-skin="sienna"] .tool-card{background:rgba(20,19,17,0.025);border-color:var(--border);border-radius:10px;}
+  :root[data-skin="sienna"] .tool-card:hover{border-color:var(--border2);}
+  :root[data-skin="sienna"] .tool-card-running{background:var(--accent-bg);border-color:var(--accent-bg-strong);}
+  :root[data-skin="sienna"] .tool-card-name{color:var(--muted);font-weight:500;}
+  :root[data-skin="sienna"] .tool-arg-key{color:var(--accent-text);}
+  :root[data-skin="sienna"] .tool-card-more{color:var(--accent-text);}
+  :root[data-skin="sienna"] .tool-card-running-dot{background:var(--accent);}
+  :root.dark[data-skin="sienna"] .tool-card{background:rgba(255,255,255,0.03);}
+  :root[data-skin="sienna"] .msg-row[data-role="user"] .msg-body{border-radius:16px;padding:12px 16px;}
+  :root[data-skin="sienna"] .msg-row[data-role="user"] .msg-body code{color:var(--user-bubble-text);background:rgba(20,19,17,0.08);}
+  :root[data-skin="sienna"] button.send-btn {box-shadow:0 1px 3px rgba(217,119,87,0.3);}
+  :root[data-skin="sienna"] button.send-btn:hover {box-shadow:0 2px 8px rgba(217,119,87,0.45);}
+  :root[data-skin="sienna"] .session-item.active{border-left:2px solid var(--accent);}
+  :root[data-skin="sienna"] .composer-box{border-radius:18px;}
+  /* ── Skin: Nebula (cyan-blue-violet) ── */
+  :root[data-skin="nebula"]{
+    --accent:#2563EB;--accent-hover:#1D4ED8;--accent-bg:rgba(37,99,235,0.1);--accent-bg-strong:rgba(37,99,235,0.2);--accent-text:#1E40AF;
+    --focus-ring:rgba(34,211,238,.32);--focus-glow:rgba(34,211,238,.11);
+    --blue:#06B6D4;
+  }
+  :root.dark[data-skin="nebula"]{
+    --accent:#22D3EE;--accent-hover:#3B82F6;--accent-bg:rgba(34,211,238,0.12);--accent-bg-strong:rgba(59,130,246,0.24);--accent-text:#93C5FD;
+    --focus-ring:rgba(34,211,238,.38);--focus-glow:rgba(34,211,238,.15);
+    --blue:#8B5CF6;
+  }
   /* #594: app-dialog light mode overrides — base styles use hardcoded dark gradients */
   :root:not(.dark) .app-dialog{
     background:linear-gradient(180deg,rgba(240,237,232,.99),rgba(228,224,216,.99));
@@ -1585,6 +1615,32 @@
 }
 .sidebar .resize-handle{right:-2px;}
 .rightpanel .resize-handle{left:-2px;}
+html[data-sidebar-panel="closed"] .sidebar{
+  width:0 !important;
+  opacity:0;
+  transform:translateX(-14px);
+  border-right-color:transparent;
+  pointer-events:none;
+}
+html[data-sidebar-panel="closed"] .sidebar .resize-handle{display:none;}
+html[data-sidebar-panel="closed"] #btnSidebarPanelToggle{
+  color:var(--accent-text);
+  background:var(--accent-bg);
+}
+html[data-sidebar-panel="closed"] #btnSidebarPanelToggle svg{transform:scaleX(-1);}
+@media(max-width:900px){
+  html[data-sidebar-panel="closed"] .sidebar{
+    width:280px !important;
+    opacity:1;
+    transform:none;
+    pointer-events:auto;
+  }
+  html[data-sidebar-panel="closed"] #btnSidebarPanelToggle{
+    color:var(--muted);
+    background:none;
+  }
+  html[data-sidebar-panel="closed"] #btnSidebarPanelToggle svg{transform:none;}
+}
 /* Prevent text selection during drag */
 body.resizing{user-select:none;cursor:col-resize;}
 

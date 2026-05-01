@@ -280,6 +280,11 @@ async function newSession(flash){
   const data=await api('/api/session/new',{method:'POST',body:JSON.stringify({model:newModel,workspace:inheritWs,profile:S.activeProfile||'default'})});
   S.session=data.session;S.messages=data.session.messages||[];
   S.lastUsage={...(data.session.last_usage||{})};
+  // Fresh sessions should not inherit stale context usage visuals.
+  if((S.session&&S.session.message_count||0)===0){
+    S.lastUsage={};
+    if(typeof _syncCtxIndicator==='function') _syncCtxIndicator({});
+  }
   if(flash)S.session._flash=true;
   localStorage.setItem('hermes-webui-session',S.session.session_id);
   _setSessionViewedCount(S.session.session_id, S.session.message_count || 0);
@@ -488,6 +493,11 @@ async function loadSession(sid){
   // Sync context usage indicator from session data
   const _s=S.session;
   if(_s&&typeof _syncCtxIndicator==='function'){
+    if(Number(_s.message_count||0)===0){
+      S.lastUsage={};
+      _syncCtxIndicator({});
+      return;
+    }
     const u=S.lastUsage||{};
     const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
     _syncCtxIndicator({

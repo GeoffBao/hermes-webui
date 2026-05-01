@@ -58,3 +58,38 @@ console.log(JSON.stringify(collapsed));
     assert '"session_id":"root"' not in collapsed
     assert '"_lineage_collapsed_count":2' in collapsed
     assert '"session_id":"solo"' in collapsed
+
+
+def test_sidebar_lineage_expand_includes_all_segments_when_root_expanded():
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+eval(extractFunc('_sessionTimestampMs'));
+eval(extractFunc('_sessionLineageKey'));
+eval(extractFunc('_collapseSessionLineageForSidebar'));
+const sessions = [
+  {{session_id:'root', title:'A', message_count:10, updated_at:10, last_message_at:10, _lineage_root_id:'root'}},
+  {{session_id:'tip', title:'A', message_count:20, updated_at:20, last_message_at:20, _lineage_root_id:'root'}},
+];
+const collapsed = _collapseSessionLineageForSidebar(sessions, new Set());
+const expanded = _collapseSessionLineageForSidebar(sessions, new Set(['root']));
+console.log(JSON.stringify({{collapsed, expanded}}));
+"""
+    output = _run_node(source)
+    assert '"collapsed":[{"session_id":"tip"' in output
+    assert '"expanded":[{"session_id":"tip"' in output
+    assert '"session_id":"root"' in output
+    assert '"_lineage_is_child":true' in output

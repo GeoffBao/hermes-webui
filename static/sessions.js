@@ -1223,19 +1223,51 @@ function _sessionLineageKey(s){
   return s._lineage_root_id || s.lineage_root_id || s.parent_session_id || null;
 }
 
-function _collapseSessionLineageForSidebar(sessions){
+const _LINEAGE_EXPANDED_KEY='hermes-lineage-expanded-roots';
+function _loadExpandedLineageRoots(){
+  try{
+    const raw=JSON.parse(localStorage.getItem(_LINEAGE_EXPANDED_KEY)||'[]');
+    if(Array.isArray(raw)) return new Set(raw.filter(v=>typeof v==='string'&&v));
+  }catch(_){}
+  return new Set();
+}
+
+function _saveExpandedLineageRoots(expanded){
+  try{
+    localStorage.setItem(_LINEAGE_EXPANDED_KEY,JSON.stringify(Array.from(expanded||[])));
+  }catch(_){}
+}
+
+function _collapseSessionLineageForSidebar(sessions, expandedRoots){
   const result=[];
   const groups=new Map();
+  const expanded=expandedRoots instanceof Set?expandedRoots:new Set();
   for(const s of sessions||[]){
     const key=_sessionLineageKey(s);
     if(!key){result.push(s);continue;}
     if(!groups.has(key)) groups.set(key,[]);
     groups.get(key).push(s);
   }
-  for(const items of groups.values()){
-    if(items.length<=1){result.push(items[0]);continue;}
-    const chosen=[...items].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a))[0];
-    result.push({...chosen,_lineage_collapsed_count:items.length});
+  for(const [key,items] of groups.entries()){
+    if(items.length<=1){
+      result.push({...items[0],_lineage_root_key:key,_lineage_collapsed_count:1,_lineage_group_expanded:false,_lineage_is_child:false});
+      continue;
+    }
+    const sorted=[...items].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+    if(expanded.has(key)){
+      for(let i=0;i<sorted.length;i++){
+        result.push({
+          ...sorted[i],
+          _lineage_root_key:key,
+          _lineage_collapsed_count:items.length,
+          _lineage_group_expanded:true,
+          _lineage_is_child:i>0,
+        });
+      }
+      continue;
+    }
+    const chosen=sorted[0];
+    result.push({...chosen,_lineage_root_key:key,_lineage_collapsed_count:items.length,_lineage_group_expanded:false,_lineage_is_child:false});
   }
   return result;
 }
@@ -1262,7 +1294,8 @@ function renderSessionListFromCache(){
   const projectFiltered=_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered;
   // Filter archived unless toggle is on
   const sessionsRaw=_showArchived?projectFiltered:projectFiltered.filter(s=>!s.archived);
-  const sessions=_collapseSessionLineageForSidebar(sessionsRaw);
+  const _expandedLineageRoots=_loadExpandedLineageRoots();
+  const sessions=_collapseSessionLineageForSidebar(sessionsRaw,_expandedLineageRoots);
   const archivedCount=projectFiltered.filter(s=>s.archived).length;
   const list=$('sessionList');list.innerHTML='';
   // Batch select bar (when in select mode)
@@ -1420,6 +1453,7 @@ function renderSessionListFromCache(){
     _rememberRenderedSessionSnapshot(s);
     const hasUnread=_hasUnreadForSession(s)&&!isActive;
     el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'');
+    if(s._lineage_is_child) el.classList.add('lineage-child');
     if(isActive&&S.session&&S.session._flash)delete S.session._flash;
     const rawTitle=s.title||'Untitled';
     const tags=(rawTitle.match(/#[\w-]+/g)||[]);
@@ -1453,6 +1487,22 @@ function renderSessionListFromCache(){
     title.className='session-title';
     title.textContent=cleanTitle||'Untitled';
     title.title='Double-click to rename';
+    if(s._lineage_collapsed_count>1&&s._lineage_root_key){
+      const lineageToggle=document.createElement('button');
+      lineageToggle.type='button';
+      lineageToggle.className='session-lineage-toggle'+(s._lineage_group_expanded?' expanded':'');
+      lineageToggle.title=s._lineage_group_expanded?'Collapse related sessions':'Expand related sessions';
+      lineageToggle.textContent=s._lineage_group_expanded?`-${s._lineage_collapsed_count}`:`+${s._lineage_collapsed_count-1}`;
+      lineageToggle.onclick=(e)=>{
+        e.stopPropagation();
+        const next=_loadExpandedLineageRoots();
+        if(next.has(s._lineage_root_key)) next.delete(s._lineage_root_key);
+        else next.add(s._lineage_root_key);
+        _saveExpandedLineageRoots(next);
+        renderSessionListFromCache();
+      };
+      titleRow.appendChild(lineageToggle);
+    }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
     const hasAttentionState=isStreaming||hasUnread;

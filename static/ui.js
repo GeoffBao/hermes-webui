@@ -3578,11 +3578,23 @@ function buildToolCard(tc){
   return row;
 }
 
+function _activityLiveSnippet(s,maxLen){
+  const t=String(s||'').replace(/\s+/g,' ').trim();
+  if(!t) return '';
+  if(t.length<=maxLen) return t;
+  return t.slice(0,Math.max(0,maxLen-1))+'…';
+}
+
 function _syncToolCallGroupSummary(group){
   if(!group) return;
   const cards=Array.from(group.querySelectorAll('.tool-card-row .tool-card'));
   const toolCount=cards.length;
-  const thinkingCount=group.querySelectorAll('.agent-activity-thinking .thinking-card').length;
+  const thinkingEls=group.querySelectorAll('.agent-activity-thinking');
+  let thinkingSegments=0;
+  thinkingEls.forEach(el=>{
+    if(el.querySelector('.thinking-card,.thinking')) thinkingSegments++;
+  });
+  const thinkingCardCount=group.querySelectorAll('.agent-activity-thinking .thinking-card').length;
   const names=cards.map(card=>{
     const el=card.querySelector('.tool-card-name');
     return el?String(el.textContent||'').trim():'';
@@ -3592,16 +3604,49 @@ function _syncToolCallGroupSummary(group){
   const list=group.querySelector('.tool-call-group-list');
   const badge=group.querySelector('.tool-call-group-count');
   const parts=[];
-  if(thinkingCount) parts.push('thinking');
+  if(thinkingCardCount||thinkingSegments) parts.push('thinking');
   if(uniqueNames.length) parts.push(uniqueNames.slice(0,5).join(', ')+(uniqueNames.length>5?'…':''));
-  const total=toolCount+thinkingCount;
+  const total=toolCount+thinkingSegments;
+
+  const runningCard=group.querySelector('.tool-card-row .tool-card.tool-card-running');
+  let liveHint='';
+  if(runningCard){
+    const n=runningCard.querySelector('.tool-card-name');
+    const p=runningCard.querySelector('.tool-card-preview');
+    const nt=n?String(n.textContent||'').trim():'';
+    const pt=p?String(p.textContent||'').trim():'';
+    liveHint=_activityLiveSnippet(pt?`${nt} — ${pt}`:nt||'tool',88);
+  }
+  if(!liveHint){
+    const activePre=group.querySelector('.agent-activity-thinking[data-thinking-active="1"] .thinking-card-body pre');
+    if(activePre){
+      const lines=String(activePre.textContent||'').split('\n').map(l=>l.trim()).filter(Boolean);
+      if(lines.length) liveHint=_activityLiveSnippet(lines[lines.length-1],88);
+    }
+  }
+  if(!liveHint){
+    const spin=group.querySelector('.agent-activity-thinking[data-thinking-active="1"] .thinking:not(.thinking-card)')
+      ||group.querySelector('.agent-activity-thinking .thinking:not(.thinking-card)');
+    if(spin) liveHint=(typeof t==='function'?t('thinking'):'Thinking')+'…';
+  }
+
+  const isLiveStream=group.hasAttribute('data-live-tool-call-group');
+  const hasRunningTool=!!group.querySelector('.tool-card.tool-card-running');
+  const hasActiveThinking=!!group.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+  const hasThinkingSpinner=!!group.querySelector('.agent-activity-thinking .thinking:not(.thinking-card)');
+  const busy=isLiveStream&&(hasRunningTool||hasActiveThinking||hasThinkingSpinner);
+  group.classList.toggle('tool-call-group-busy',busy);
+
   if(label){
-    if(thinkingCount&&toolCount) label.textContent=`Activity: thinking + ${toolCount} tool${toolCount===1?'':'s'}`;
-    else if(thinkingCount) label.textContent='Activity: thinking';
+    if(thinkingCardCount&&toolCount) label.textContent=`Activity: thinking + ${toolCount} tool${toolCount===1?'':'s'}`;
+    else if(thinkingCardCount||thinkingSegments) label.textContent='Activity: thinking';
     else if(toolCount) label.textContent=`Activity: ${toolCount} tool${toolCount===1?'':'s'}`;
     else label.textContent='Activity';
   }
-  if(list) list.textContent=parts.join(' · ')||'tools / thinking';
+  if(list){
+    if(liveHint) list.textContent=liveHint;
+    else list.textContent=parts.join(' · ')||'tools / thinking';
+  }
   if(badge) badge.textContent=String(total);
 }
 

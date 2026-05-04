@@ -234,6 +234,13 @@ def reload_config() -> None:
         # still hits the fast path without a cold run.
         if _old_cfg_mtime != 0.0:
             _delete_models_cache_on_disk()
+        # External edits (CLI, another app) bump config.yaml mtime; the early
+        # mtime check in get_available_models() calls reload_config() *before*
+        # the TTL gate syncs _cfg_mtime, so the in-lock _cfg_changed branch never
+        # fires and the 24h in-memory /api/models cache would otherwise stay stale
+        # until process restart.  Clear it whenever the file's mtime actually moved.
+        if _old_cfg_mtime != 0.0 and _cfg_mtime != _old_cfg_mtime:
+            invalidate_models_cache()
 
 
 def _load_yaml_config_file(config_path: Path) -> dict:
@@ -704,6 +711,7 @@ _PROVIDER_MODELS = {
         {"id": "moonshot-v1-128k", "label": "Moonshot v1 128k"},
         {"id": "kimi-latest", "label": "Kimi Latest"},
         {"id": "kimi-k2.5", "label": "Kimi K2.5"},
+        {"id": "kimi-k2.6", "label": "Kimi K2.6"},
     ],
     "minimax": [
         {"id": "MiniMax-M2.7", "label": "MiniMax M2.7"},

@@ -146,6 +146,38 @@ def test_mtime_invalidation():
     _reset_cache()
 
 
+def test_external_config_yaml_change_busts_models_memory_cache(tmp_path, monkeypatch):
+    """CLI / terminal edits to config.yaml must not leave a stale /api/models TTL snapshot.
+
+    Regression: get_available_models() calls reload_config() when mtime drifts,
+    which syncs _cfg_mtime before the in-lock path runs — so _cfg_changed was false
+    and the 24h in-memory cache kept serving the previous default_model.
+    """
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "model:\n  default: model-alpha\n  provider: openai\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: cfg_file)
+
+    config.invalidate_models_cache()
+    config._cfg_mtime = 0.0
+    config.reload_config()
+
+    alpha = config.get_available_models()
+    assert alpha.get("default_model") == "model-alpha"
+
+    cfg_file.write_text(
+        "model:\n  default: model-beta\n  provider: openai\n",
+        encoding="utf-8",
+    )
+
+    beta = config.get_available_models()
+    assert beta.get("default_model") == "model-beta"
+
+    _reset_cache()
+
+
 # ── 4. test_deepcopy_isolation ────────────────────────────────────────────
 
 def test_deepcopy_isolation():

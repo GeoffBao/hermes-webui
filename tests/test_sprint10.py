@@ -104,6 +104,30 @@ def test_crons_output_limit_param(cleanup_test_sessions):
     # 404 or 200 with empty -- both acceptable for nonexistent job
     assert status in (200, 404)
 
+
+def test_crons_history_requires_job_id(cleanup_test_sessions):
+    try:
+        get("/api/crons/history")
+        assert False
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
+def test_crons_history_empty_job(cleanup_test_sessions):
+    data, status = get("/api/crons/history?job_id=nonexistent_job_id_xyz&limit=50")
+    assert status == 200
+    assert data.get("runs") == []
+    assert data.get("total") == 0
+
+
+def test_crons_run_get_requires_filename(cleanup_test_sessions):
+    try:
+        get("/api/crons/run?job_id=someid")
+        assert False
+    except urllib.error.HTTPError as e:
+        assert e.code in (400, 404)
+
+
 def test_cron_history_button_in_panels_js(cleanup_test_sessions):
     src, _ = get_text("/static/panels.js")
     # After the main-view refactor, cron runs load inline into the detail card
@@ -117,7 +141,7 @@ def test_cron_output_snippet_helper(cleanup_test_sessions):
 
 
 def test_cron_output_window_preserves_response_after_large_prompt(cleanup_test_sessions):
-    """Large skill dumps before ## Response must not hide the useful output."""
+    """Large skill dumps in ## Prompt must not appear in the UI window — only Response body."""
     from api.routes import _cron_output_content_window
 
     content = (
@@ -132,9 +156,23 @@ def test_cron_output_window_preserves_response_after_large_prompt(cleanup_test_s
     window = _cron_output_content_window(content, limit=8000)
 
     assert len(window) <= 8000
-    assert "## Response" in window
     assert "actual useful cron result" in window
-    assert "Job metadata" in window
+    assert "skill dump" not in window
+    assert "Job metadata" not in window
+    assert "## Prompt" not in window
+    assert "## Response" not in window
+
+
+def test_cron_output_window_extracts_error_body(cleanup_test_sessions):
+    from api.routes import _cron_output_content_window
+
+    content = (
+        "# Cron Job: x\n\n## Prompt\n" + ("p\n" * 500) + "\n## Error\n\n```\nTimeoutError: boom\n```\n"
+    )
+    window = _cron_output_content_window(content, limit=8000)
+    assert "TimeoutError" in window
+    assert "## Prompt" not in window
+    assert "p\np\n" not in window  # collapsed repetitive prompt lines shouldn't dominate
 
 
 def test_cron_output_window_without_response_uses_tail(cleanup_test_sessions):

@@ -37,7 +37,6 @@ _CLIENT_DISCONNECT_ERRORS = (
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
 _RUNNING_CRON_LOCK = threading.Lock()
 _CRON_OUTPUT_CONTENT_LIMIT = 8000
-_CRON_OUTPUT_HEADER_CONTEXT = 200
 
 
 def _mark_cron_running(job_id: str):
@@ -59,37 +58,61 @@ def _is_cron_running(job_id: str) -> tuple[bool, float]:
         return True, time.time() - t
 
 
-def _cron_response_marker_index(text: str) -> int:
-    """Return the start index of a markdown Response heading, if present."""
-    candidates = []
-    for heading in ("## Response", "# Response"):
+def _cron_heading_line_start(text: str, headings: tuple[str, ...]) -> int:
+    """Index of the first line that starts with one of ``headings``."""
+    candidates: list[int] = []
+    for heading in headings:
         if text.startswith(heading):
             candidates.append(0)
-        idx = text.find(f"\n{heading}")
+        idx = text.find("\n" + heading)
         if idx >= 0:
             candidates.append(idx + 1)
     return min(candidates) if candidates else -1
 
 
-def _cron_output_content_window(text: str, limit: int = _CRON_OUTPUT_CONTENT_LIMIT) -> str:
-    """Return a bounded cron output window that preserves useful response text.
+def _cron_body_after_heading_line(text: str, headings: tuple[str, ...]) -> str | None:
+    """Text after the first matching heading line, excluding that line."""
+    start = _cron_heading_line_start(text, headings)
+    if start < 0:
+        return None
+    line_end = text.find("\n", start)
+    if line_end < 0:
+        return ""
+    return text[line_end + 1 :]
 
-    Cron output files can contain large skill dumps in the Prompt section. The
-    UI already extracts ``## Response`` when present, so keep that section in
-    the API payload instead of blindly returning the first ``limit`` chars.
+
+def _cron_primary_output_body(text: str) -> str | None:
+    """Return assistant reply or error body — excludes Cron Job header and Prompt."""
+    for headings in (
+        ("## Response", "# Response"),
+        ("## Error", "# Error"),
+    ):
+        body = _cron_body_after_heading_line(text, headings)
+        if body is not None:
+            return body
+    return None
+
+
+def _cron_output_content_window(text: str, limit: int = _CRON_OUTPUT_CONTENT_LIMIT) -> str:
+    """Return bounded text for cron UI: prefer Response/Error body only (no prompt dump).
+
+    Scheduler writes ``## Prompt`` (often huge) then ``## Response`` or ``## Error``.
+    Listing/detail APIs use this helper so the WebUI shows the useful part first.
     """
     if limit <= 0:
         return ""
+
+    primary = _cron_primary_output_body(text)
+    if primary is not None:
+        chunk = primary.strip()
+        if not chunk:
+            return "(empty)"
+        if len(chunk) <= limit:
+            return chunk
+        return chunk[:limit]
+
     if len(text) <= limit:
         return text
-
-    response_idx = _cron_response_marker_index(text)
-    if response_idx >= 0:
-        header = text[:min(_CRON_OUTPUT_HEADER_CONTEXT, response_idx)].rstrip()
-        response = text[response_idx:].lstrip("\n")
-        content = f"{header}\n...\n{response}" if header else response
-        return content[:limit]
-
     return text[-limit:]
 
 
@@ -1356,6 +1379,14 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/crons/status":
         return _handle_cron_status(handler, parsed)
+
+    if parsed.path == "/api/crons/history":
+        return _handle_cron_history(handler, parsed)
+
+    if parsed.path == "/api/crons/run":
+        qs = parse_qs(parsed.query)
+        if qs.get("filename", [""])[0]:
+            return _handle_cron_run_read(handler, parsed)
 
     # ── Skills API (GET) ──
     if parsed.path == "/api/skills":
@@ -3283,6 +3314,64 @@ def _handle_cron_output(handler, parsed):
             except Exception:
                 logger.debug("Failed to read cron output file %s", f)
     return j(handler, {"job_id": job_id, "outputs": outputs})
+
+
+def _handle_cron_history(handler, parsed):
+    """List past run output files for a job (metadata only). Used by Tasks detail UI."""
+    from cron.jobs import OUTPUT_DIR as CRON_OUT
+
+    qs = parse_qs(parsed.query)
+    job_id = qs.get("job_id", [""])[0]
+    try:
+        limit = int(qs.get("limit", ["50"])[0])
+    except ValueError:
+        limit = 50
+    if not job_id:
+        return j(handler, {"error": "job_id required"}, status=400)
+    limit = max(1, min(limit, 200))
+    out_dir = CRON_OUT / job_id
+    runs = []
+    total = 0
+    if out_dir.is_dir():
+        files = [p for p in out_dir.iterdir() if p.is_file() and p.suffix == ".md"]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        total = len(files)
+        for f in files[:limit]:
+            st = f.stat()
+            runs.append(
+                {
+                    "filename": f.name,
+                    "size": st.st_size,
+                    "modified": st.st_mtime,
+                }
+            )
+    return j(handler, {"runs": runs, "total": total})
+
+
+def _handle_cron_run_read(handler, parsed):
+    """GET one saved cron output .md (snippet + full text). POST /api/crons/run triggers execution."""
+    from cron.jobs import OUTPUT_DIR as CRON_OUT
+
+    qs = parse_qs(parsed.query)
+    job_id = qs.get("job_id", [""])[0]
+    filename = qs.get("filename", [""])[0]
+    if not job_id or not filename:
+        return j(handler, {"error": "job_id and filename required"}, status=400)
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return j(handler, {"error": "invalid filename"}, status=400)
+    if not filename.endswith(".md"):
+        return j(handler, {"error": "invalid filename"}, status=400)
+    base = (CRON_OUT / job_id).resolve()
+    path = (base / filename).resolve()
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return j(handler, {"error": "invalid path"}, status=400)
+    if not path.is_file():
+        return j(handler, {"error": "not found"}, status=404)
+    txt = path.read_text(encoding="utf-8", errors="replace")
+    window = _cron_output_content_window(txt)
+    return j(handler, {"snippet": window, "content": txt})
 
 
 def _handle_cron_status(handler, parsed):

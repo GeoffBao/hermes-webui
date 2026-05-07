@@ -608,6 +608,10 @@ const LOCALES = {
     cron_run_now: 'Run now',
     cron_pause: 'Pause',
     cron_resume: 'Resume',
+    cron_profile_label: 'Profile',
+    cron_profile_server_default: 'Server default',
+    cron_profile_server_default_hint:
+      'Uses the WebUI server default profile (Hermes home) at run time.',
     cron_job_name_placeholder: 'Job name',
     cron_schedule_placeholder: 'Schedule',
     cron_prompt_placeholder: 'Prompt',
@@ -1988,6 +1992,10 @@ const LOCALES = {
     cron_run_now: 'Run now',
     cron_pause: 'Pause',
     cron_resume: 'Resume',
+    cron_profile_label: 'Perfil',
+    cron_profile_server_default: 'Predeterminado del servidor',
+    cron_profile_server_default_hint:
+      'Usa el perfil predeterminado del WebUI (Hermes home) al ejecutar.',
     cron_job_name_placeholder: 'Job name',
     cron_schedule_placeholder: 'Schedule',
     cron_prompt_placeholder: 'Prompt',
@@ -3442,6 +3450,10 @@ const LOCALES = {
     cron_run_now: '立即运行',
     cron_pause: '暂停',
     cron_resume: '恢复',
+    cron_profile_label: '运行配置',
+    cron_profile_server_default: '服务器默认',
+    cron_profile_server_default_hint:
+      '执行时使用 WebUI 当前默认配置（Hermes home）。',
     cron_job_name_placeholder: '任务名称',
     cron_schedule_placeholder: '调度表达式',
     cron_prompt_placeholder: '提示词',
@@ -4362,6 +4374,10 @@ const LOCALES = {
     cron_prompt_placeholder: '\u63d0\u793a\u8a5e',
     cron_prompt_required: '\u9700\u8981\u63d0\u793a\u8a5e',
     cron_resume: '\u6062\u5fa9',
+    cron_profile_label: '\u57f7\u884c\u8a2d\u5b9a',
+    cron_profile_server_default: '\u4f3a\u670d\u5668\u9810\u8a2d',
+    cron_profile_server_default_hint:
+      '\u57f7\u884c\u6642\u4f7f\u7528 WebUI \u76ee\u524d\u9810\u8a2d\u8a2d\u5b9a\uff08Hermes home\uff09\u3002',
     cron_run_now: '\u7acb\u5373\u57f7\u884c',
     cron_schedule_placeholder: '\u6392\u7a0b',
     cron_schedule_required: '\u9700\u8981\u6392\u7a0b',

@@ -381,13 +381,24 @@ async function loadCrons(animate) {
       item.id = 'cron-' + job.id;
       const status = _cronStatusMeta(job);
       const isNewRun = _cronNewJobIds.has(String(job.id));
+      const profileName = _cronProfileName(job.profile);
       const profileLabel = _cronProfileLabel(job.profile);
       const profileTitle = _cronProfileTitle(job.profile);
+      const listTitle = (
+        job.name ||
+        job.schedule_display ||
+        (job.schedule && job.schedule.display) ||
+        job.id ||
+        ''
+      ).toString();
+      const profileBadge = profileName
+        ? `<span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>`
+        : '';
       item.innerHTML = `
         <div class="cron-header">
           ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
-          <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
-          <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
+          <span class="cron-name" title="${esc(listTitle)}">${esc(listTitle)}</span>
+          ${profileBadge}
           <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
         </div>`;
       item.onclick = () => openCronDetail(job.id, item);
@@ -525,7 +536,12 @@ async function _loadCronDetailRuns(jobId){
     }).join('');
     const countLabel = data.total > 50 ? ` (${data.total} runs, showing latest 50)` : ` (${data.total} runs)`;
     card.innerHTML = `<div class="detail-card-title">${esc(t('cron_last_output'))}${countLabel}</div>${rows}`;
-  } catch(e) { /* ignore */ }
+  } catch(e) {
+    if (!_currentCronDetail || _currentCronDetail.id !== jobId) return;
+    const cardErr = $('cronDetailRuns');
+    if (!cardErr) return;
+    cardErr.innerHTML = `<div class="detail-card-title">${esc(t('cron_last_output'))}</div><div style="color:var(--accent-text);font-size:12px">${esc(t('error_prefix'))}${esc(e.message || String(e))}</div>`;
+  }
 }
 
 async function _loadRunContent(jobId, filename, runId){
@@ -864,9 +880,17 @@ const submitCronCreate = saveCronForm;
 function toggleCronForm(){ openCronCreate(); }
 
 function _cronOutputSnippet(content) {
-  // Extract the response body from a cron output .md file
+  // Prefer assistant/error body from saved cron .md (skip Prompt / metadata).
   const lines = content.split('\n');
-  const responseIdx = lines.findIndex(l => l.startsWith('## Response') || l.startsWith('# Response'));
+  const markers = ['## Response', '# Response', '## Error', '# Error'];
+  let responseIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (markers.some(m => line.startsWith(m))) {
+      responseIdx = i;
+      break;
+    }
+  }
   const body = (responseIdx >= 0 ? lines.slice(responseIdx + 1) : lines).join('\n').trim();
   return body.slice(0, 600) || '(empty)';
 }

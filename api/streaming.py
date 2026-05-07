@@ -945,8 +945,10 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
                     return
                 s.title = next_title
                 s.llm_title_generated = True
-                s.save(touch_updated_at=False)
                 effective_title = s.title
+            # IMPORTANT: must not call Session.save() while holding global LOCK.
+            # Tests assert this to prevent deadlocks / contention.
+            s.save(touch_updated_at=False)
         _put_title_status(put_event, session_id, 'refreshed', llm_status, effective_title, raw_preview)
         put_event('title', {'session_id': session_id, 'title': effective_title})
         logger.info("Adaptive title refresh: session=%s new_title=%r", session_id, effective_title)

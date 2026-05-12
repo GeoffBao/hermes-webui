@@ -5,14 +5,15 @@ Wraps hermes_cli.profiles to provide profile switching for the web UI.
 The web UI maintains a process-level "active profile" that determines which
 HERMES_HOME directory is used for config, skills, memory, cron, and API keys.
 Profile switches update os.environ['HERMES_HOME'] and monkey-patch module-level
-cached paths in hermes-agent modules (skills_tool, cron/jobs) that snapshot
-HERMES_HOME at import time.
+cached paths in hermes-agent modules (skills_tool, skill_manager_tool,
+cron/jobs) that snapshot HERMES_HOME at import time.
 """
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -243,13 +244,7 @@ def _set_hermes_home(home: Path):
     """Set HERMES_HOME env var and monkey-patch cached module-level paths."""
     os.environ['HERMES_HOME'] = str(home)
 
-    # Patch skills_tool module-level cache (snapshots HERMES_HOME at import)
-    try:
-        import tools.skills_tool as _sk
-        _sk.HERMES_HOME = home
-        _sk.SKILLS_DIR = home / 'skills'
-    except (ImportError, AttributeError):
-        logger.debug("Failed to patch skills_tool module")
+    _patch_skill_home_modules(home)
 
     # Patch cron/jobs module-level cache
     try:
@@ -306,6 +301,7 @@ def init_profile_state() -> None:
     _active_profile = _read_active_profile_file()
     home = get_active_hermes_home()
     _set_hermes_home(home)
+    install_cron_scheduler_profile_isolation()
     _reload_dotenv(home)
 
 
@@ -329,13 +325,18 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     # Import here to avoid circular import at module load
     from api.config import STREAMS, STREAMS_LOCK, reload_config
 
-    # Block if agent is running
-    with STREAMS_LOCK:
-        if len(STREAMS) > 0:
-            raise RuntimeError(
-                'Cannot switch profiles while an agent is running. '
-                'Cancel or wait for it to finish.'
-            )
+    # Process-wide profile switches mutate HERMES_HOME, module-level path caches,
+    # os.environ-backed .env keys, and the global config cache. Keep those blocked
+    # while any agent stream is active. Per-client WebUI switches are cookie/TLS
+    # scoped (process_wide=False) and do not mutate those globals, so users can
+    # leave a running session in one profile and start work in another (#1700).
+    if process_wide:
+        with STREAMS_LOCK:
+            if len(STREAMS) > 0:
+                raise RuntimeError(
+                    'Cannot switch profiles while an agent is running. '
+                    'Cancel or wait for it to finish.'
+                )
 
     # Resolve profile directory
     if name == 'default':

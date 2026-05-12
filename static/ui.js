@@ -1,6 +1,8 @@
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default'};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false};
 const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
+const MAX_UPLOAD_BYTES=20*1024*1024;
+const MAX_UPLOAD_MB=Math.round(MAX_UPLOAD_BYTES/1024/1024);
 // Tracks which session's queue to drain in setBusy(false).
 // Set to activeSid just before setBusy(false) in done/error handlers so the
 // queue drains the session that *finished*, not the one currently viewed.
@@ -60,6 +62,14 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
  */
 function _renderUserFencedBlocks(text){
   const stash=[];
+  const mathStash=[];
+  const stashMath=(type,src)=>{mathStash.push({type,src});return '\x00UM'+(mathStash.length-1)+'\x00';};
+  const restoreMath=html=>String(html||'').replace(/\x00UM(\d+)\x00/g,(_,i)=>{
+    const item=mathStash[+i];
+    if(!item) return '';
+    if(item.type==='display') return `<div class="katex-block" data-katex="display">${esc(item.src)}</div>`;
+    return `<span class="katex-inline" data-katex="inline">${esc(item.src)}</span>`;
+  });
   let s=String(text||'');
   // Extract fenced code blocks → stash, replace with null-token placeholder
   s=s.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g,(_,lang,code)=>{
@@ -81,10 +91,17 @@ function _renderUserFencedBlocks(text){
     }
     return '\x00UF'+(stash.length-1)+'\x00';
   });
+  // Now stash math from the OUTSIDE-of-fence text. Display delimiters must
+  // run before inline so $$..$$ isn't mis-parsed as $..$..$..$.
+  s=s.replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>stashMath('display',m));
+  s=s.replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>stashMath('display',m));
+  s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>stashMath('inline',m));
+  s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>stashMath('inline',m));
   // Escape remaining plain text and convert newlines to <br>
   s=esc(s).replace(/\n/g,'<br>');
-  // Restore stashed code blocks
+  // Restore stashed code blocks, then math placeholders as KaTeX targets.
   s=s.replace(/\x00UF(\d+)\x00/g,(_,i)=>stash[+i]);
+  s=restoreMath(s);
   return s;
 }
 
@@ -119,9 +136,19 @@ function _closeImgLightbox(lb) {
 }
 
 document.addEventListener('click', e => {
-  const img = e.target && e.target.closest ? e.target.closest('.msg-media-img') : null;
-  if(!img) return;
-  _openImgLightbox(img.src, img.alt);
+  if(!e.target || !e.target.closest) return;
+  // Message-attached images (already wired since v0.50.x).
+  let img = e.target.closest('.msg-media-img');
+  if(img){ _openImgLightbox(img.src, img.alt); return; }
+  // Composer attach-tray image thumbnails — click any pasted/dropped image
+  // chip to lightbox-zoom it before sending. Excludes audio/video chips,
+  // which keep their inline media controls. SVG thumbnails (.attach-thumb--svg)
+  // are still images visually, so they qualify.
+  img = e.target.closest('.attach-thumb');
+  if(img && img.tagName === 'IMG'){
+    _openImgLightbox(img.src, img.alt || img.title || 'Attached image');
+    return;
+  }
 });
 
 const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
@@ -184,6 +211,10 @@ function _renderAttachmentHtml(fname, url){
   const kind=_mediaKindForName(fname);
   if(kind==='image') return `<img class="msg-media-img" src="${esc(url)}" alt="${esc(fname)}" loading="lazy">`;
   if(kind==='audio'||kind==='video') return _mediaPlayerHtml(kind,url,fname);
+  if(_HTML_EXTS.test(fname)){
+    const inlineUrl=url+(String(url).includes('?')?'&':'?')+'inline=1';
+    return `<a class="msg-file-badge msg-file-badge--html" href="${esc(inlineUrl)}" target="_blank" rel="noopener">${li('file-code',12)} ${esc(fname)}</a>`;
+  }
   return `<div class="msg-file-badge">${li('paperclip',12)} ${esc(fname)}</div>`;
 }
 document.addEventListener('click', e => {
@@ -272,13 +303,55 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
 
 // Set the model picker to the best match for modelId.
 // Returns the resolved value that was actually set, or null if nothing matched.
+function _refreshOpenModelDropdown(){
+  const dd=$('composerModelDropdown');
+  if(dd&&dd.classList&&dd.classList.contains('open')&&typeof renderModelDropdown==='function'){
+    renderModelDropdown();
+    if(typeof _positionModelDropdown==='function') _positionModelDropdown();
+  }
+}
 function _applyModelToDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
   const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
-    if(sel.id==='modelSelect' && typeof syncModelChip==='function') syncModelChip();
+    if(sel.id==='modelSelect'){
+      if(typeof syncModelChip==='function') syncModelChip();
+      _refreshOpenModelDropdown();
+    }
     return resolved;
+  }
+  return null;
+}
+function _modelStateFromAppliedDropdown(sel, modelValue){
+  const state=(typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel,modelValue)
+    : {model:modelValue,model_provider:null};
+  return {model:state.model||modelValue,model_provider:state.model_provider||null};
+}
+function _persistSessionModelCorrection(model, provider){
+  if(!S.session) return;
+  fetch(new URL('api/session/update',document.baseURI||location.href).href,{
+    method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:model,model_provider:provider||null})
+  }).catch(()=>{});
+}
+function _applySessionModelFallback(sel){
+  if(!sel) return null;
+  const configuredDefault=String(window._defaultModel||'').trim();
+  if(configuredDefault){
+    const appliedDefault=_applyModelToDropdown(configuredDefault,sel,window._activeProvider||null);
+    if(appliedDefault) return _modelStateFromAppliedDropdown(sel,appliedDefault);
+  }
+  const first=sel.querySelector('optgroup > option, option');
+  if(first){
+    sel.value=first.value;
+    if(sel.id==='modelSelect'){
+      if(typeof syncModelChip==='function') syncModelChip();
+      _refreshOpenModelDropdown();
+    }
+    return _modelStateFromAppliedDropdown(sel,first.value);
   }
   return null;
 }
@@ -318,6 +391,11 @@ async function populateModelDropdown(){
       _applyModelToDropdown(data.default_model, sel, data.active_provider||null);
     }
     if(typeof syncModelChip==='function') syncModelChip();
+    const dd=$('composerModelDropdown');
+    if(dd&&dd.classList.contains('open')&&typeof renderModelDropdown==='function'){
+      renderModelDropdown();
+      _positionModelDropdown();
+    }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
     if(data.active_provider) _fetchLiveModels(data.active_provider, sel);
@@ -415,7 +493,7 @@ async function _fetchLiveModels(provider, sel){
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
       if(typeof syncModelChip==='function') syncModelChip();
-      console.log('[hermes] Live models loaded for',provider+':',added,'new models added');
+      console.debug('[hermes] Live models loaded for',provider+':',added,'new models added');
     }
   }catch(e){
     console.debug('[hermes] Live model fetch failed for',provider,e.message);
@@ -696,7 +774,7 @@ async function selectModelFromDropdown(value){
   if(typeof sel.onchange==='function') await sel.onchange();
 }
 
-function toggleModelDropdown(){
+async function toggleModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
   const sel=$('modelSelect');
@@ -1134,6 +1212,46 @@ document.addEventListener('DOMContentLoaded',function(){
   tooltip.addEventListener('click',function(e){e.stopPropagation();});
 });
 
+function _setMessageScrollToBottom(){
+  const el=$('messages');
+  if(!el) return;
+  _programmaticScroll=true;
+  el.scrollTop=el.scrollHeight;
+  _lastScrollTop=el.scrollTop;
+  _nearBottomCount=2;
+  _scrollPinned=true;
+  requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+}
+function _isMessagePaneNearBottom(threshold=250){
+  const el=$('messages');
+  if(!el) return false;
+  return el.scrollHeight-el.scrollTop-el.clientHeight<=threshold;
+}
+function _shouldFollowMessagesOnDomReplace(){
+  return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(1200));
+}
+function _settleMessageScrollToBottom(force){
+  // Markdown post-processing (Prism, tables, Mermaid/KaTeX/PDF placeholders)
+  // can grow the transcript after the first scroll write. Re-apply the bottom
+  // position across a few frames while pinned so late layout does not leave the
+  // viewport a few lines above the real end. User scroll increments
+  // _bottomSettleToken and cancels the delayed passes.
+  const token=++_bottomSettleToken;
+  const passes=[0,16,80,180];
+  passes.forEach(delay=>setTimeout(()=>{
+    if(token!==_bottomSettleToken) return;
+    if(!force && (!_scrollPinned||_recentNonMessageScrollIntent())) return;
+    _setMessageScrollToBottom();
+  },delay));
+  requestAnimationFrame(()=>{
+    if(token!==_bottomSettleToken) return;
+    if(force || (_scrollPinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
+    requestAnimationFrame(()=>{
+      if(token!==_bottomSettleToken) return;
+      if(force || (_scrollPinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
+    });
+  });
+}
 function scrollIfPinned(){
   if(!_scrollPinned) return;
   const el=$('messages');
@@ -1145,6 +1263,7 @@ function scrollToBottom(){
   if(el) el.scrollTop=el.scrollHeight;
   const btn=$('scrollToBottomBtn');
   if(btn) btn.style.display='none';
+  if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
 }
 
 function _fmtOllamaLabel(mid){
@@ -1353,14 +1472,16 @@ function renderMd(raw){
   // Math stash: protect $$..$$ and $..$ from markdown processing
   // Runs AFTER fence_stash so backtick code spans protect their dollar-sign contents
   const math_stash=[];
-  // Display math: $$...$$  (must come before inline to avoid mis-parsing)
+  // Display math: $$...$$ and \[...\] (must come before inline to avoid mis-parsing)
   s=s.replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Match a single literal backslash before the display delimiter (the common LLM form).
+  s=s.replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Inline math: $...$ — require non-space at boundaries to avoid false positives
   // e.g. "costs $5 and $10" should not trigger (space after opening $)
   s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
-  // Also stash \(...\) and \[...\] LaTeX delimiters
-  s=s.replace(/\\\\\((.+?)\\\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
-  s=s.replace(/\\\\\[(.+?)\\\\\]/gs,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Also stash \(...\) LaTeX delimiters.
+  // Match a single literal backslash before the delimiter (the common LLM form).
+  s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Safe tag → markdown equivalent (these produce the same output as **text** etc.)
   // Stash raw <pre> blocks so the inline <code> rewrite below does not run
   // inside them. Running that rewrite in <pre> content can introduce stray
@@ -1719,6 +1840,13 @@ let _composerLockState=null;
 function lockComposerForClarify(placeholderText){
   const input=$('msg');
   if(!input) return;
+  // Save the current composer text as a server-side draft before locking,
+  // so the user's draft is preserved if they switch sessions while a clarify
+  // card is active (and survives page refresh / syncs across clients).
+  const sid = S && S.session && S.session.session_id;
+  if (sid && typeof _saveComposerDraftNow === 'function') {
+    _saveComposerDraftNow(sid, input.value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+  }
   if(!_composerLockState){
     _composerLockState={
       disabled: input.disabled,
@@ -2158,7 +2286,31 @@ function updateQueueBadge(sessionId){
     }
   }
 }
-function showToast(msg,ms,type){const el=$('toast');if(!el)return;const s=String(msg==null?'':msg);let t=type;if(!t){const low=s.toLowerCase();if(/fail|error|denied|invalid|unavailable|no active|no workspace match|no model match|no personalities/.test(low))t='error';else if(/warn|queued|takes effect|skipped|fallback/.test(low))t='warning';else if(/saved|created|imported|restored|switched|set to|updated|duplicated|moved to|renamed|deleted|complete|pinned|archived|cleared|stopped/.test(low))t='success';else t='info';}el.textContent=s;el.className='toast show '+t;clearTimeout(el._t);el._t=setTimeout(()=>{el.classList.remove('show');},ms||2800);}
+const TOAST_DEFAULT_MS=2800;
+const TOAST_ERROR_DEFAULT_MS=20000;
+function clearToastDismissTimer(el){if(!el)return;clearTimeout(el._t);el._t=null;}
+function setToastDismissTimer(el,duration){if(!el)return;clearToastDismissTimer(el);el._t=setTimeout(()=>{el.classList.remove('show');},duration);}
+function copyToastText(btn){
+  const el=btn&&btn.closest?btn.closest('#toast'):null;
+  const text=el?(el.dataset.toastMessage||el.textContent||''):'';
+  const done=()=>{const old=btn.textContent;btn.textContent='Copied';setTimeout(()=>{btn.textContent=old;},1200);};
+  _copyText(text).then(done).catch(()=>{});
+}
+function showToast(msg,ms,type){
+  const el=$('toast');if(!el)return;
+  const s=String(msg==null?'':msg);let t=type;
+  if(!t){const low=s.toLowerCase();if(/fail|error|denied|invalid|unavailable|no active|no workspace match|no model match|no personalities/.test(low))t='error';else if(/warn|queued|takes effect|skipped|fallback/.test(low))t='warning';else if(/saved|created|imported|restored|switched|set to|updated|duplicated|moved to|renamed|deleted|complete|pinned|archived|cleared|stopped/.test(low))t='success';else t='info';}
+  const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
+  el.className='toast show '+t;
+  el.dataset.toastMessage=s;
+  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button>`;
+  else el.textContent=s;
+  el.onmouseenter=()=>clearToastDismissTimer(el);
+  el.onmouseleave=()=>setToastDismissTimer(el,duration);
+  el.onfocusin=()=>clearToastDismissTimer(el);
+  el.onfocusout=()=>setToastDismissTimer(el,duration);
+  setToastDismissTimer(el,duration);
+}
 
 // ── Shared app dialogs ───────────────────────────────────────────────────────
 // showConfirmDialog(opts) and showPromptDialog(opts) replace browser-native dialog calls
@@ -2289,7 +2441,11 @@ function showPromptDialog(opts={}){
   if(desc) desc.textContent=opts.message||'';
   if(input){
     input.type=opts.inputType||'text';input.style.display='';
-    input.value=opts.value||'';input.placeholder=opts.placeholder||'';
+    // Pre-fill: prefer `value`, accept `defaultValue` as alias for callers that
+    // mirror the standard HTMLInputElement.defaultValue naming. Both empty →
+    // blank field (the default rename-from-scratch flow stays unchanged).
+    const prefill=(opts.value!=null?opts.value:(opts.defaultValue!=null?opts.defaultValue:''));
+    input.value=prefill;input.placeholder=opts.placeholder||'';
     input.autocomplete='off';input.spellcheck=false;
   }
   if(cancelBtn) cancelBtn.textContent=opts.cancelLabel||t('cancel');
@@ -2298,7 +2454,27 @@ function showPromptDialog(opts={}){
   if(overlay){overlay.style.display='flex';overlay.setAttribute('aria-hidden','false');}
   return new Promise(resolve=>{
     APP_DIALOG.resolve=resolve;
-    setTimeout(()=>{if(input&&input.style.display!=='none')input.focus();else if(confirmBtn)confirmBtn.focus();},0);
+    setTimeout(()=>{
+      if(input&&input.style.display!=='none'){
+        input.focus();
+        // Selection behavior on focus:
+        //   selectStem:true → select everything before the LAST '.' (e.g. for
+        //     'report.txt' selects 'report' so a user can retype the basename
+        //     without losing the extension; matches macOS Finder rename UX).
+        //     Falls back to selecting the full value when there's no '.' or
+        //     the dot is at index 0 ('.gitignore' → full select).
+        //   selectAll:true → select the entire prefilled value.
+        //   default       → caret at end (current behavior).
+        const v=input.value||'';
+        if(opts.selectStem && v){
+          const dot=v.lastIndexOf('.');
+          if(dot>0) input.setSelectionRange(0,dot);
+          else input.select();
+        } else if(opts.selectAll && v){
+          input.select();
+        }
+      } else if(confirmBtn) confirmBtn.focus();
+    },0);
   });
 }
 
@@ -2589,6 +2765,7 @@ function syncTopbar(){
   if(!S.session){
     document.title=window._botName||'Hermes';
     if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
+    if(typeof _syncWorkspaceHeadingState==='function') _syncWorkspaceHeadingState();
     if(typeof syncModelChip==='function') syncModelChip();
     if(typeof syncTerminalButton==='function') syncTerminalButton();
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
@@ -2610,6 +2787,7 @@ function syncTopbar(){
   const vis=S.messages.filter(m=>m&&m.role&&m.role!=='tool');
   const _topbarMeta=$('topbarMeta');if(_topbarMeta)_topbarMeta.textContent=t('n_messages',vis.length);
   if(typeof syncAppTitlebar==='function') syncAppTitlebar();
+  if(typeof _syncWorkspaceHeadingState==='function') _syncWorkspaceHeadingState();
   // If a profile switch just happened, apply its model rather than the session's stale value.
   // S._pendingProfileModel is set by switchToProfile() and cleared here after one application.
   const modelOverride=S._pendingProfileModel;
@@ -2739,11 +2917,44 @@ function _thinkingActivityNode(text){
 // finalized into a settled assistant turn (the live attribute is removed in
 // _convertLiveActivityGroupToSettled / when liveAssistantTurn loses its id).
 let _liveActivityUserExpanded;
+const _activityDisclosureStoragePrefix='hermes-activity-disclosure:';
+function _activityDisclosureStorageKey(activityKey){
+  if(!activityKey||!S.session||!S.session.session_id) return null;
+  return _activityDisclosureStoragePrefix+S.session.session_id+':'+activityKey;
+}
+function _readActivityDisclosureState(activityKey){
+  const key=_activityDisclosureStorageKey(activityKey);
+  if(!key) return null;
+  try{
+    const saved=localStorage.getItem(key);
+    return saved==='open'||saved==='closed'?saved:null;
+  }catch(_){return null;}
+}
+function _writeActivityDisclosureState(activityKey, open){
+  const key=_activityDisclosureStorageKey(activityKey);
+  if(!key) return;
+  try{localStorage.setItem(key, open?'open':'closed');}catch(_){}
+}
+function _copyActivityDisclosureState(fromActivityKey, toActivityKey){
+  const state=_readActivityDisclosureState(fromActivityKey);
+  if(state) _writeActivityDisclosureState(toActivityKey, state==='open');
+}
+function _activityKeyForLiveTurn(){
+  return S.activeStreamId?'live:'+S.activeStreamId:null;
+}
 function _onLiveActivityToggle(group){
   if(!group) return;
   // Only track explicit user clicks on the live group, not programmatic toggles.
   if(group.getAttribute('data-live-tool-call-group')!=='1') return;
   _liveActivityUserExpanded = !group.classList.contains('tool-call-group-collapsed');
+}
+function _toggleActivityGroup(summary){
+  const group=summary&&summary.closest?summary.closest('.tool-call-group'):null;
+  if(!group) return;
+  const collapsed=group.classList.toggle('tool-call-group-collapsed');
+  summary.setAttribute('aria-expanded',String(!collapsed));
+  _writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);
+  if(typeof _onLiveActivityToggle==='function') _onLiveActivityToggle(group);
 }
 function _clearLiveActivityUserIntent(){
   _liveActivityUserExpanded = undefined;
@@ -2752,23 +2963,31 @@ function ensureActivityGroup(inner, opts){
   opts=opts||{};
   if(!inner) return null;
   const live=!!opts.live;
+  const activityKey=opts.activityKey||(live?_activityKeyForLiveTurn():null);
   const selector=live?'.tool-call-group[data-live-tool-call-group="1"]':'.tool-call-group[data-agent-activity-group="1"]';
   let group=inner.querySelector(selector);
   if(!group){
     group=document.createElement('div');
     let collapsed=opts.collapsed!==false;
+    const savedState=_readActivityDisclosureState(activityKey);
     // Restore the user's explicit expand intent when recreating the live
-    // activity group within the same turn (#1298).
+    // activity group within the same turn (#1298), then let persisted chat/turn
+    // state win across session switches and reloads.
     if(live && _liveActivityUserExpanded === true) collapsed=false;
     else if(live && _liveActivityUserExpanded === false) collapsed=true;
+    if(savedState==='open') collapsed=false;
+    else if(savedState==='closed') collapsed=true;
     group.className='tool-call-group agent-activity-group'+(collapsed?' tool-call-group-collapsed':'');
     group.setAttribute('data-tool-call-group','1');
     group.setAttribute('data-agent-activity-group','1');
+    if(activityKey) group.setAttribute('data-activity-disclosure-key',activityKey);
     if(live) group.setAttribute('data-live-tool-call-group','1');
     group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="const g=this.closest('.tool-call-group');const c=g.classList.toggle('tool-call-group-collapsed');this.setAttribute('aria-expanded',String(!c));if(typeof _onLiveActivityToggle==='function')_onLiveActivityToggle(g);"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-list">tools / thinking</span><span class="tool-call-group-count">0</span></button><div class="tool-call-group-body"></div>`;
     const anchor=opts.anchor||null;
     if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
     else inner.appendChild(group);
+  }else if(activityKey&&!group.getAttribute('data-activity-disclosure-key')){
+    group.setAttribute('data-activity-disclosure-key',activityKey);
   }
   _syncToolCallGroupSummary(group);
   return group;
@@ -3074,6 +3293,9 @@ function renderMessages(){
   const sessionCompressionAnchorKey=(
     S.session && S.session.compression_anchor_message_key && typeof S.session.compression_anchor_message_key==='object'
   ) ? S.session.compression_anchor_message_key : null;
+  const sessionCompressionSummary=(
+    S.session && typeof S.session.compression_anchor_summary==='string'
+  ) ? S.session.compression_anchor_summary.trim() : '';
   const preservedCompressionTaskMessages=_latestPreservedCompressionTaskListMessages(S.messages);
   const vis=S.messages.filter(m=>{
     if(!m||!m.role||m.role==='tool')return false;
@@ -3099,8 +3321,10 @@ function renderMessages(){
   }
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const referenceMessage=S.messages.find(m=>_isContextCompactionMessage(m));
-  const referenceText=referenceMessage?msgContent(referenceMessage)||String(referenceMessage.content||''):'';
-  const referenceNode=(!compressionState && referenceMessage && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey))
+  const referenceText=referenceMessage
+    ? msgContent(referenceMessage)||String(referenceMessage.content||'')
+    : sessionCompressionSummary;
+  const referenceNode=(!compressionState && !!referenceText && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   let preservedCompressionTaskCardsAttached=!!referenceNode;
@@ -3312,20 +3536,12 @@ function renderMessages(){
     // fallback-built cards carry their result snippet (not just the command).
     // Without this step CLI-origin sessions reload with empty tool cards.
     const resultsByTid={};
-    const _snipFromRaw=(raw)=>{
-      const s=String(raw||'');
-      try{
-        const rd=JSON.parse(s);
-        if(rd && typeof rd==='object') return String(rd.output||rd.result||rd.error||s).slice(0,200);
-      }catch(e){}
-      return s.slice(0,200);
-    };
     S.messages.forEach(m=>{
       if(!m) return;
       // OpenAI / Hermes CLI format: role=tool with tool_call_id
       if(m.role==='tool'){
         const tid=m.tool_call_id||m.tool_use_id||'';
-        if(tid) resultsByTid[tid]=_snipFromRaw(m.content);
+        if(tid) resultsByTid[tid]=_cliToolResultSnippet(m.content);
         return;
       }
       // Anthropic format: tool_result blocks inside a user message content array
@@ -3337,7 +3553,7 @@ function renderMessages(){
           const raw=typeof p.content==='string'?p.content
                    :Array.isArray(p.content)?p.content.map(c=>c&&c.text?c.text:'').join('')
                    :'';
-          resultsByTid[tid]=_snipFromRaw(raw);
+          resultsByTid[tid]=_cliToolResultSnippet(raw);
         });
       }
     });
@@ -3351,10 +3567,20 @@ function renderMessages(){
         const name=fn.name||tc.name||'tool';
         let args={};
         try{ args=JSON.parse(fn.arguments||'{}'); }catch(e){}
+        const tid=tc.id||tc.call_id||'';
+        const patchSnippet=_cliPatchSnippetFromArgs(name,args);
+        const resultSnippet=resultsByTid[tid]||'';
         let argsSnap={};
         Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
-        const tid=tc.id||tc.call_id||'';
-        derived.push({name,snippet:resultsByTid[tid]||'',tid,assistant_msg_idx:rawIdx,args:argsSnap,done:true});
+        derived.push({
+          name,
+          snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
+          is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
+          tid,
+          assistant_msg_idx:rawIdx,
+          args:argsSnap,
+          done:true,
+        });
       });
       // Anthropic format: tool_use blocks inside assistant content array
       if(Array.isArray(m.content)){
@@ -3362,12 +3588,22 @@ function renderMessages(){
           if(!p||typeof p!=='object'||p.type!=='tool_use') return;
           const name=p.name||'tool';
           const args=p.input||{};
+          const tid=p.id||'';
+          const patchSnippet=_cliPatchSnippetFromArgs(name,args);
+          const resultSnippet=resultsByTid[tid]||'';
           const argsSnap={};
           if(args && typeof args==='object'){
             Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
           }
-          const tid=p.id||'';
-          derived.push({name,snippet:resultsByTid[tid]||'',tid,assistant_msg_idx:rawIdx,args:argsSnap,done:true});
+          derived.push({
+            name,
+            snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
+            is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
+            tid,
+            assistant_msg_idx:rawIdx,
+            args:argsSnap,
+            done:true,
+          });
         });
       }
     });
@@ -3548,6 +3784,8 @@ function buildToolCard(tc){
     }
   }
   const hasMore=tc.snippet&&tc.snippet.length>displaySnippet.length;
+  const moreLabel=tc.is_diff?'Show diff':'Show more';
+  const lessLabel=tc.is_diff?'Hide diff':'Show less';
   const runIndicator=tc.done===false?'<span class="tool-card-running-dot"></span>':'';
   const isSubagent=tc.name==='subagent_progress';
   const isDelegation=tc.name==='delegate_task';
@@ -3571,7 +3809,7 @@ function buildToolCard(tc){
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
           <pre>${esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" onclick="event.stopPropagation();const p=this.previousElementSibling;const full=this.dataset.full;const short=this.dataset.short;p.textContent=p.textContent===short?full:short;this.textContent=p.textContent===short?'Show more':'Show less'">Show more</button>`:''}
+          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();const p=this.previousElementSibling;const full=this.dataset.full;const short=this.dataset.short;p.textContent=p.textContent===short?full:short;this.textContent=p.textContent===short?this.dataset.moreLabel:this.dataset.lessLabel">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
@@ -3647,7 +3885,6 @@ function _syncToolCallGroupSummary(group){
     if(liveHint) list.textContent=liveHint;
     else list.textContent=parts.join(' · ')||'tools / thinking';
   }
-  if(badge) badge.textContent=String(total);
 }
 
 // ── Live tool card helpers (called during SSE streaming) ──
@@ -3711,7 +3948,7 @@ function appendLiveToolCard(tc){
   }
   const children=Array.from(inner.children);
   const anchor=children.filter(el=>el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')).pop();
-  const group=ensureActivityGroup(inner,{live:true,collapsed:false,anchor});
+  const group=ensureActivityGroup(inner,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
   const body=group.querySelector('.tool-call-group-body');
   // Update existing card in place (tool_complete after tool_start)
   if(tid){
@@ -4287,13 +4524,13 @@ function loadHtmlInline(){
       .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
-          const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
-          el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
+          const openUrl='api/media?path='+encodeURIComponent(path)+'&inline=1';
+          el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
           return;
         }
-        const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
+        const openUrl='api/media?path='+encodeURIComponent(path)+'&inline=1';
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${dlUrl}" download="${esc(fname)}" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
+        el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
       .catch(()=>{
         const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
@@ -4497,7 +4734,7 @@ function appendThinking(text=''){
     el.id!=='toolRunningRow' &&
     el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')
   ).pop();
-  const group=ensureActivityGroup(blocks,{live:true,collapsed:true,anchor});
+  const group=ensureActivityGroup(blocks,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
   const body=group&&group.querySelector('.tool-call-group-body');
   if(!body) return;
   let row=body.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
@@ -4588,6 +4825,250 @@ function renderBreadcrumb(){
   }
 }
 
+const WORKSPACE_HIDDEN_FILE_NAMES=new Set([
+  '.DS_Store','._.DS_Store','.AppleDouble','.Spotlight-V100','.Trashes','.fseventsd',
+  'Thumbs.db','Desktop.ini','ehthumbs.db','$RECYCLE.BIN',
+  '.directory','.git','.svn','.hg','node_modules','__pycache__',
+  '.pytest_cache','.mypy_cache','.ruff_cache','.tox','.venv','venv'
+]);
+const WORKSPACE_HIDDEN_FILE_PREFIXES=['._','.Trash-'];
+function _workspaceShouldHideEntry(item){
+  if(!item||S.showHiddenWorkspaceFiles)return false;
+  const name=String(item.name||'');
+  if(!name)return false;
+  if(WORKSPACE_HIDDEN_FILE_NAMES.has(name))return true;
+  return WORKSPACE_HIDDEN_FILE_PREFIXES.some(prefix=>name.startsWith(prefix));
+}
+function _visibleWorkspaceEntries(entries){
+  const list=Array.isArray(entries)?entries:[];
+  return S.showHiddenWorkspaceFiles?list:list.filter(item=>!_workspaceShouldHideEntry(item));
+}
+function _syncWorkspaceHiddenToggle(){
+  const el=$('workspaceShowHiddenFiles');
+  if(el)el.checked=!!S.showHiddenWorkspaceFiles;
+  // Reflect "hidden files are visible" state on the panel heading + kebab dot,
+  // so users can see they've flipped a non-default workspace pref without
+  // having to open the menu. The menu itself stays out of the way otherwise.
+  const ind=$('workspaceHiddenIndicator');
+  if(ind){
+    if(S.showHiddenWorkspaceFiles){ ind.hidden=false; ind.removeAttribute('hidden'); }
+    else { ind.hidden=true; ind.setAttribute('hidden',''); }
+  }
+  const dot=$('workspacePrefsDot');
+  if(dot){
+    if(S.showHiddenWorkspaceFiles){ dot.hidden=false; dot.removeAttribute('hidden'); }
+    else { dot.hidden=true; dot.setAttribute('hidden',''); }
+  }
+}
+function toggleWorkspaceHiddenFiles(value){
+  S.showHiddenWorkspaceFiles=!!value;
+  try{localStorage.setItem('hermes-workspace-show-hidden-files',S.showHiddenWorkspaceFiles?'1':'0');}catch(_){}
+  _syncWorkspaceHiddenToggle();
+  renderFileTree();
+}
+try{S.showHiddenWorkspaceFiles=localStorage.getItem('hermes-workspace-show-hidden-files')==='1';}catch(_){}
+
+// ── Workspace preferences kebab menu (#1793 UX refinement) ───────────────
+// The "Show hidden files" toggle used to live as a permanent inline row
+// below the breadcrumb bar. That ate ~32px of vertical space on every
+// panel view (root, subdir, file preview), even though the toggle is a
+// set-once preference — most users flip it once or never. Moving the
+// control into a kebab dropdown reclaims the space; the small "(hidden
+// files visible)" indicator on the heading reflects the non-default state
+// so the affordance isn't lost.
+let _workspacePrefsMenu = null;
+let _workspacePrefsAnchor = null;
+function _closeWorkspacePrefsMenu(){
+  if(_workspacePrefsMenu){ _workspacePrefsMenu.remove(); _workspacePrefsMenu=null; }
+  if(_workspacePrefsAnchor){
+    _workspacePrefsAnchor.classList.remove('active');
+    _workspacePrefsAnchor.setAttribute('aria-expanded','false');
+    _workspacePrefsAnchor=null;
+  }
+}
+function _positionWorkspacePrefsMenu(anchorEl){
+  if(!_workspacePrefsMenu||!anchorEl) return;
+  const rect=anchorEl.getBoundingClientRect();
+  const menuW=Math.min(260, Math.max(220, _workspacePrefsMenu.scrollWidth||220));
+  let left=rect.right-menuW;
+  if(left<8) left=8;
+  if(left+menuW>window.innerWidth-8) left=window.innerWidth-menuW-8;
+  let top=rect.bottom+6;
+  const menuH=_workspacePrefsMenu.offsetHeight||0;
+  if(top+menuH>window.innerHeight-8 && rect.top>menuH+12) top=rect.top-menuH-6;
+  if(top<8) top=8;
+  _workspacePrefsMenu.style.left=left+'px';
+  _workspacePrefsMenu.style.top=top+'px';
+}
+function _buildWorkspacePrefsMenu(){
+  const menu=document.createElement('div');
+  menu.className='workspace-prefs-menu open';
+  menu.setAttribute('role','menu');
+  // The checkbox keeps id="workspaceShowHiddenFiles" so existing call
+  // sites (and the existing test_issue1793_file_tree_cruft_filter test)
+  // can find it the same way as before. Only the parent container moves.
+  const labelTxt = (typeof t==='function' ? t('workspace_show_hidden_files') : 'Show hidden files');
+  const descTxt  = (typeof t==='function' ? t('workspace_show_hidden_files_desc') : 'Include .DS_Store, .git, node_modules, and other hidden / system files in the file tree.');
+  const row=document.createElement('label');
+  row.className='workspace-prefs-item';
+  row.setAttribute('role','menuitemcheckbox');
+  row.innerHTML=
+    '<input type="checkbox" id="workspaceShowHiddenFiles" '+
+    'onchange="toggleWorkspaceHiddenFiles(this.checked)">'+
+    '<span class="workspace-prefs-copy">'+
+      '<span class="workspace-prefs-name">'+esc(labelTxt)+'</span>'+
+      '<span class="workspace-prefs-meta">'+esc(descTxt)+'</span>'+
+    '</span>';
+  const cb=row.querySelector('input');
+  if(cb) cb.checked=!!S.showHiddenWorkspaceFiles;
+  menu.appendChild(row);
+  return menu;
+}
+function toggleWorkspacePrefsMenu(e){
+  if(e&&e.preventDefault) e.preventDefault();
+  if(e&&e.stopPropagation) e.stopPropagation();
+  // Anchor preference: the kebab button. The indicator chip can also open
+  // the same menu (click on "(hidden visible)"), but anchor positioning
+  // always references the kebab so the menu lands in the same place.
+  const anchor=$('btnWorkspacePrefs')||(e&&e.currentTarget)||null;
+  if(_workspacePrefsMenu&&_workspacePrefsAnchor===anchor){ _closeWorkspacePrefsMenu(); return; }
+  _closeWorkspacePrefsMenu();
+  const menu=_buildWorkspacePrefsMenu();
+  document.body.appendChild(menu);
+  _workspacePrefsMenu=menu;
+  _workspacePrefsAnchor=anchor;
+  if(anchor){ anchor.classList.add('active'); anchor.setAttribute('aria-expanded','true'); }
+  _positionWorkspacePrefsMenu(anchor);
+}
+document.addEventListener('click',e=>{
+  if(!_workspacePrefsMenu) return;
+  if(_workspacePrefsMenu.contains(e.target)) return;
+  if(_workspacePrefsAnchor&&_workspacePrefsAnchor.contains(e.target)) return;
+  // Indicator chip is also an opener — clicking it should toggle, not close.
+  const ind=$('workspaceHiddenIndicator');
+  if(ind&&ind.contains(e.target)) return;
+  _closeWorkspacePrefsMenu();
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&_workspacePrefsMenu) _closeWorkspacePrefsMenu();
+});
+window.addEventListener('resize',()=>{
+  if(_workspacePrefsMenu&&_workspacePrefsAnchor) _positionWorkspacePrefsMenu(_workspacePrefsAnchor);
+});
+
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_syncWorkspaceHiddenToggle);
+else _syncWorkspaceHiddenToggle();
+
+function bindWorkspaceHeadingActions(){
+  const heading=$('workspacePanelHeading');
+  if(!heading||heading.dataset.bound==='1')return;
+  heading.dataset.bound='1';
+  const goRoot=()=>{
+    if(S.session&&S.session.workspace) loadDir('.');
+  };
+  heading.onclick=goRoot;
+  heading.onkeydown=(e)=>{
+    if(!(S.session&&S.session.workspace)) return;
+    if(e.key==='Enter'||e.key===' '){
+      e.preventDefault();
+      goRoot();
+    }
+  };
+  heading.oncontextmenu=(e)=>{
+    if(!(S.session&&S.session.workspace)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    _showWorkspaceRootContextMenu(e);
+  };
+  _syncWorkspaceHeadingState();
+}
+
+function _syncWorkspaceHeadingState(){
+  const heading=$('workspacePanelHeading');
+  if(!heading) return;
+  const enabled=!!(S.session&&S.session.workspace);
+  heading.classList.toggle('workspace-panel-heading--enabled',enabled);
+  if(enabled){
+    heading.setAttribute('role','button');
+    heading.setAttribute('tabindex','0');
+    heading.setAttribute('aria-disabled','false');
+    heading.title='Workspace root';
+  } else {
+    heading.removeAttribute('role');
+    heading.removeAttribute('tabindex');
+    heading.setAttribute('aria-disabled','true');
+    heading.title=t('no_workspace');
+  }
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',bindWorkspaceHeadingActions);
+else bindWorkspaceHeadingActions();
+
+function _workspaceContextMenuItem(label, onClick, opts={}){
+  const item=document.createElement('div');
+  item.textContent=label;
+  item.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:'+(opts.danger?'var(--error,#e94560)':'var(--text)')+';';
+  item.onmouseenter=()=>item.style.background='var(--hover-bg)';
+  item.onmouseleave=()=>item.style.background='';
+  item.onclick=onClick;
+  return item;
+}
+
+function _copyTextWithFallback(text, successMsg, failurePrefix){
+  const done=()=>showToast(successMsg);
+  const fail=(err)=>showToast(failurePrefix+(err&&err.message?err.message:String(err||'')));
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(text).then(done).catch(err=>{
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      let copied=false;
+      try{copied=document.execCommand('copy');}catch(_){}
+      ta.remove();
+      if(copied) done(); else fail(err);
+    });
+  }
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+  document.body.appendChild(ta);
+  ta.select();
+  let copied=false;
+  try{copied=document.execCommand('copy');}catch(err){ta.remove();fail(err);return Promise.resolve();}
+  ta.remove();
+  if(copied) done(); else fail('clipboard unavailable');
+  return Promise.resolve();
+}
+
+function _showWorkspaceRootContextMenu(e){
+  document.querySelectorAll('.file-ctx-menu').forEach(el=>el.remove());
+  const menu=document.createElement('div');
+  menu.className='file-ctx-menu workspace-root-ctx-menu';
+  menu.style.cssText='position:fixed;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 0;z-index:9999;min-width:160px;box-shadow:0 4px 16px rgba(0,0,0,.35);';
+  const vw=window.innerWidth,vh=window.innerHeight;
+  menu.style.left=(e.clientX+160>vw?e.clientX-170:e.clientX)+'px';
+  menu.style.top=(e.clientY+80>vh?e.clientY-80:e.clientY)+'px';
+
+  menu.appendChild(_workspaceContextMenuItem(t('reveal_in_finder'),async()=>{
+    menu.remove();
+    try{await api('/api/file/reveal',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:'.'})});}
+    catch(err){showToast(t('reveal_failed')+(err.message||err));}
+  }));
+
+  menu.appendChild(_workspaceContextMenuItem(t('copy_file_path'),async()=>{
+    menu.remove();
+    try{
+      const r=await api('/api/file/path',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:'.'})});
+      await _copyTextWithFallback((r&&r.path)||'.',t('path_copied'),t('path_copy_failed'));
+    }catch(err){showToast(t('path_copy_failed')+(err.message||err));}
+  }));
+
+  document.body.appendChild(menu);
+  const dismiss=()=>{menu.remove();document.removeEventListener('click',dismiss);};
+  setTimeout(()=>document.addEventListener('click',dismiss),0);
+}
+
 // Track expanded directories for tree view
 if(!S._expandedDirs) S._expandedDirs=new Set();
 // Cache of fetched directory contents: path -> entries[]
@@ -4607,11 +5088,12 @@ function renderFileTree(){
   }
   if(emptyEl) emptyEl.style.display='none';
   box.style.display='';
-  if(!S.entries||!S.entries.length){
+  const visibleEntries=_visibleWorkspaceEntries(S.entries);
+  if(!visibleEntries.length){
     if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display='flex';}
     return;
   }
-  _renderTreeItems(box, S.entries, 0);
+  _renderTreeItems(box, visibleEntries, 0);
 }
 
 function _renderTreeItems(container, entries, depth){
@@ -4737,7 +5219,7 @@ function _renderTreeItems(container, entries, depth){
 
     // Render children if directory is expanded
     if(item.type==='dir'&&S._expandedDirs.has(item.path)){
-      const children=S._dirCache[item.path]||[];
+      const children=_visibleWorkspaceEntries(S._dirCache[item.path]||[]);
       if(children.length){
         _renderTreeItems(container, children, depth+1);
       }else{
@@ -4779,7 +5261,7 @@ function _showFileContextMenu(e, item){
   const renameItem=document.createElement('div');
   renameItem.textContent=t('rename_title');
   renameItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
-  renameItem.onmouseenter=()=>renameItem.style.background='var(--hover)';
+  renameItem.onmouseenter=()=>renameItem.style.background='var(--hover-bg)';
   renameItem.onmouseleave=()=>renameItem.style.background='';
   renameItem.onclick=()=>{menu.remove();_inlineRenameFileItem(item);};
   menu.appendChild(renameItem);
@@ -4791,7 +5273,7 @@ function _showFileContextMenu(e, item){
   const delItem=document.createElement('div');
   delItem.textContent=t('delete_title');
   delItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--error,#e94560);';
-  delItem.onmouseenter=()=>delItem.style.background='var(--hover)';
+  delItem.onmouseenter=()=>delItem.style.background='var(--hover-bg)';
   delItem.onmouseleave=()=>delItem.style.background='';
   delItem.onclick=()=>{menu.remove();if(item.type==='dir')deleteWorkspaceDir(item.path,item.name);else deleteWorkspaceFile(item.path,item.name);};
   menu.appendChild(delItem);
@@ -4803,7 +5285,18 @@ function _showFileContextMenu(e, item){
 
 async function _inlineRenameFileItem(item){
   if(!S.session)return;
-  const newName=await showPromptDialog({message:t('rename_prompt'),defaultValue:item.name,placeholder:item.name,confirmLabel:t('rename_title')});
+  // Pre-fill the input with the current name and select just the stem
+  // (everything before the last '.') so the user can immediately retype the
+  // basename while preserving the extension — matches macOS Finder. For
+  // directories or names with no '.', the helper selects the full value.
+  // `selectStem` also handles dotfiles ('.gitignore') by full-selecting.
+  const newName=await showPromptDialog({
+    message:t('rename_prompt'),
+    value:item.name,
+    confirmLabel:t('rename_title'),
+    selectStem:item.type!=='dir',
+    selectAll:item.type==='dir'
+  });
   if(!newName||newName===item.name)return;
   try{
     await api('/api/file/rename',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path,new_name:newName})});
@@ -4929,7 +5422,22 @@ function renderTray(){ // non-media files use paperclip chip
     tray.appendChild(chip);
   });
 }
-function addFiles(files){for(const f of files){if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);}renderTray();}
+function _uploadTooLargeMessage(file){
+  const fileSizeMb=Math.ceil(((file&&file.size)||0)/1024/1024);
+  return t('upload_too_large',MAX_UPLOAD_MB,fileSizeMb);
+}
+function _showUploadTooLarge(file){
+  const message=`${t('upload_failed')}${file&&file.name?file.name:'file'} \u2014 ${_uploadTooLargeMessage(file)}`;
+  if(typeof setStatus==='function')setStatus(`\u274c ${message}`);
+  else if(typeof showToast==='function')showToast(message,5000,'error');
+}
+function addFiles(files){
+  for(const f of files){
+    if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
+    if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);
+  }
+  renderTray();
+}
 async function uploadPendingFiles(){
   if(!S.pendingFiles.length||!S.session)return[];
   const names=[];let failures=0;
@@ -4937,9 +5445,11 @@ async function uploadPendingFiles(){
   barWrap.classList.add('active');bar.style.width='0%';
   const total=S.pendingFiles.length;
   for(let i=0;i<total;i++){
-    const f=S.pendingFiles[i];const fd=new FormData();
-    fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
+    const f=S.pendingFiles[i];
     try{
+      if(f&&f.size>MAX_UPLOAD_BYTES)throw new Error(_uploadTooLargeMessage(f));
+      const fd=new FormData();
+      fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
       const isArchive=_ARCHIVE_EXTS.test(f.name);
       const url=new URL(isArchive?'api/upload/extract':'api/upload',location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});

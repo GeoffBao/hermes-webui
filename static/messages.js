@@ -225,10 +225,10 @@ async function send(){
   startClarifyPolling(activeSid);
   _fetchYoloState(activeSid);  // sync YOLO pill with backend state
   S.activeStreamId = null;  // will be set after stream starts
+  if(typeof updateSendBtn==='function') updateSendBtn();
   // AbortController for the pre-stream window so Stop can cancel the pending request.
   const _startAbort=new AbortController();
   window._abortPendingChatStart=()=>{try{_startAbort.abort();}catch(_){}};
-  if(typeof updateSendBtn==='function') updateSendBtn();
 
   // Set provisional title from user message immediately so session appears
   // in the sidebar right away with a meaningful name (server may refine later)

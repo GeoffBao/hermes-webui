@@ -1,6 +1,6 @@
 async function cancelStream(){
   const streamId = S.activeStreamId;
-  if(!streamId){if(typeof _abortPendingChatStart==='function')_abortPendingChatStart();if(S.busy)setBusy(false);return;}
+  if(!streamId){window._abortPendingChatStart?.();if(S.busy){setBusy(false);if(typeof removeThinking==='function')removeThinking();}return;}
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
   }catch(e){/* cancel request failed - cleanup below still runs */}

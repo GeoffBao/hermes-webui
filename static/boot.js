@@ -1,6 +1,18 @@
 async function cancelStream(){
   const streamId = S.activeStreamId;
-  if(!streamId) return;
+  if(!streamId){
+    // Pre-stream gap: /api/chat/start hasn't responded yet but S.busy is true.
+    // Abort the in-flight request (if an AbortController is wired up) and reset
+    // UI so the button and thinking indicator recover immediately.
+    if(typeof _abortPendingChatStart==='function') _abortPendingChatStart();
+    if(S.busy){
+      S.activeStreamId=null;
+      setBusy(false);
+      if(typeof removeThinking==='function') removeThinking();
+      if(typeof setComposerStatus==='function') setComposerStatus('');
+    }
+    return;
+  }
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
   }catch(e){/* cancel request failed - cleanup below still runs */}

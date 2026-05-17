@@ -2796,7 +2796,10 @@ function getComposerPrimaryAction(){
   const isBusy=!!S.busy||compressionRunning;
   if(!isBusy) return hasContent?'send':'disabled';
   if(!hasContent){
-    if(S.activeStreamId&&typeof cancelStream==='function') return 'stop';
+    // Show stop whenever we are busy — including the pre-stream gap where
+    // S.busy=true but S.activeStreamId is still null (waiting for /api/chat/start
+    // to return a stream_id).  cancelStream() already handles the null-stream case.
+    if((S.busy||S.activeStreamId)&&typeof cancelStream==='function') return 'stop';
     return 'disabled';
   }
   const explicitAction=_getExplicitBusyCommandAction(msg&&msg.value);
@@ -6334,7 +6337,11 @@ function appendThinking(text=''){
   // Guard: ignore if session was switched during an async SSE stream.
   // The old stream's reasoning events can still fire after switch;
   // without this check they would pollute the new session's DOM.
-  if(!S.session||!S.activeStreamId) return;
+  // Exception: allow showing the thinking dots during the pre-stream gap
+  // (S.busy=true but S.activeStreamId not yet assigned) so users get
+  // immediate visual feedback on slow providers.
+  if(!S.session) return;
+  if(!S.busy&&!S.activeStreamId) return;
   $('emptyState').style.display='none';
   let turn=$('liveAssistantTurn');
   if(!turn){

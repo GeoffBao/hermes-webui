@@ -210,7 +210,9 @@ async function send(){
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
-  S.messages.push(userMsg);renderMessages();appendThinking();setBusy(true);
+  // setBusy(true) BEFORE appendThinking() so the pre-stream gap shows the
+  // thinking dots immediately (appendThinking guards on S.busy||S.activeStreamId).
+  S.messages.push(userMsg);renderMessages();setBusy(true);appendThinking();
   // First optimistic pass: make the local user turn visible before /api/chat/start
   // can save pending state on the server.
   if(typeof upsertActiveSessionForLocalTurn==='function'){
@@ -224,7 +226,10 @@ async function send(){
   startApprovalPolling(activeSid);
   startClarifyPolling(activeSid);
   _fetchYoloState(activeSid);  // sync YOLO pill with backend state
-  S.activeStreamId = null;  // will be set after stream starts
+  S.activeStreamId = null;  // will be set after /api/chat/start responds
+  // AbortController for the pre-stream window so Stop can cancel the pending request.
+  const _startAbort=new AbortController();
+  window._abortPendingChatStart=()=>{try{_startAbort.abort();}catch(_){}};
   if(typeof updateSendBtn==='function') updateSendBtn();
 
   // Set provisional title from user message immediately so session appears
@@ -252,7 +257,7 @@ async function send(){
   // Start the agent via POST, get a stream_id back
   let streamId;
   try{
-    const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const startData=await api('/api/chat/start',{method:'POST',signal:_startAbort.signal,body:JSON.stringify({
       session_id:activeSid,message:msgText,
       model:S.session.model||$('modelSelect').value,workspace:S.session.workspace,
       model_provider:S.session.model_provider||null,
@@ -276,8 +281,10 @@ async function send(){
     }
     streamId=startData.stream_id;
     S.activeStreamId = streamId;
-    // setBusy(true) already ran with activeStreamId=null; refresh now that we
-    // have a stream id so the primary button can switch to Stop (see getComposerPrimaryAction).
+    window._abortPendingChatStart=null;  // pre-stream window closed
+    // setBusy(true) already ran with activeStreamId=null; updateSendBtn is now a
+    // no-op since the button already shows stop (pre-stream gap fix), but keep the
+    // call so any other callers that read activeStreamId get the right state.
     if(typeof updateSendBtn==='function') updateSendBtn();
     if(S.session&&typeof startData.pending_started_at==='number'){
       S.session.pending_started_at=startData.pending_started_at;
@@ -300,6 +307,16 @@ async function send(){
       void renderSessionList();
     }
   }catch(e){
+    // Abort = user clicked Stop during the pre-stream gap.  cancelStream() already
+    // cleared S.busy and removed the thinking indicator; just clean up INFLIGHT.
+    if(e&&e.name==='AbortError'){
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      stopApprovalPolling();stopClarifyPolling();
+      if(typeof renderSessionList==='function') void renderSessionList();
+      return;
+    }
+    window._abortPendingChatStart=null;
     const errMsg=String((e&&e.message)||'');
     const conflictActiveStream=/session already has an active stream/i.test(errMsg);
     if(conflictActiveStream){

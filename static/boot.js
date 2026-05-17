@@ -1,6 +1,6 @@
 async function cancelStream(){
   const streamId = S.activeStreamId;
-  if(!streamId) return;
+  if(!streamId){if(typeof _abortPendingChatStart==='function')_abortPendingChatStart();if(S.busy)setBusy(false);return;}
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
   }catch(e){/* cancel request failed - cleanup below still runs */}
@@ -223,6 +223,62 @@ function closeMobileSidebar(){
   if(sidebar)sidebar.classList.remove('mobile-open');
   if(overlay)overlay.classList.remove('visible');
 }
+
+// ── Desktop sidebar collapse toggle ────────────────────────────────────────
+// Two discoverability paths into the same state:
+//   (1) Click the already-active rail icon → collapse / expand the sidebar.
+//   (2) Cmd/Ctrl+B keyboard shortcut (VS Code convention).
+// Mobile is unaffected: the sidebar is an overlay there, and every collapse
+// code path is gated on `_isDesktopWidth()` (min-width:641px).
+// State is persisted via localStorage and survives reloads + bfcache.
+const _SIDEBAR_COLLAPSED_KEY='hermes-webui-sidebar-collapsed';
+
+function _isDesktopWidth(){
+  try{return window.matchMedia('(min-width:641px)').matches;}catch(_){return true;}
+}
+
+function _isSidebarCollapsed(){
+  return document.querySelector('.layout')?.classList.contains('sidebar-collapsed')||false;
+}
+
+function _syncSidebarAria(){
+  // Mirror the open/collapsed state on the active rail button via aria-expanded
+  // so screen readers announce the toggle. Open=true, collapsed=false.
+  const active=document.querySelector('.rail .rail-btn.nav-tab.active[data-panel]');
+  if(active)active.setAttribute('aria-expanded',!_isSidebarCollapsed());
+}
+
+function toggleSidebar(forceState){
+  if(!_isDesktopWidth())return; // mobile uses an overlay; never collapse there
+  const layout=document.querySelector('.layout');
+  if(!layout)return;
+  const next=typeof forceState==='boolean'?forceState:!_isSidebarCollapsed();
+  layout.classList.toggle('sidebar-collapsed',next);
+  // Clear the flash-prevention root-level marker once JS owns the state.
+  try{document.documentElement.removeAttribute('data-sidebar-collapsed');}catch(_){}
+  try{localStorage.setItem(_SIDEBAR_COLLAPSED_KEY,next?'1':'0');}catch(_){}
+  _syncSidebarAria();
+}
+
+function expandSidebar(){
+  if(_isSidebarCollapsed())toggleSidebar(false);
+}
+
+// Boot-time restore. The inline flash-prevention script in index.html already
+// set data-sidebar-collapsed='1' on <html> before the stylesheet so the page
+// renders collapsed without paint flash. This IIFE promotes that pre-paint
+// state into the .layout class system where both JS and CSS can read it.
+(function _restoreSidebarState(){
+  try{document.documentElement.removeAttribute('data-sidebar-collapsed');}catch(_){}
+  if(!_isDesktopWidth())return;
+  try{
+    if(localStorage.getItem(_SIDEBAR_COLLAPSED_KEY)==='1'){
+      const layout=document.querySelector('.layout');
+      if(layout)layout.classList.add('sidebar-collapsed');
+    }
+  }catch(_){}
+  _syncSidebarAria();
+})();
 function toggleMobileFiles(){
   toggleWorkspacePanel();
 }
@@ -267,7 +323,7 @@ $('btnSend').onclick=()=>{
   }
   send();
 };
-$('btnAttach').onclick=()=>$('fileInput').click();
+$('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInput').value='';$('fileInput').click();};
 
 // ── Voice input (Web Speech API + MediaRecorder fallback) ───────────────────
 (function(){
@@ -786,7 +842,11 @@ $('btnNewChat').onclick=async()=>{
      && !S.session.pending_user_message){
     $('msg').focus();closeMobileSidebar();return;
   }
-  await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+  try{
+    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+  }catch(err){
+    if(typeof showToast==='function') showToast('Failed to start new conversation: '+(err&&err.message||err),3000,'error');
+  }
 };
 $('btnDownload').onclick=()=>{
   if(!S.session)return;
@@ -820,10 +880,11 @@ $('importFileInput').onchange=async(e)=>{
   }
 };
 // btnRefreshFiles is now panel-icon-btn in header (see HTML)
-function clearPreview(){
+function clearPreview(opts={}){
+  const keepPanelOpen=!!(opts&&opts.keepPanelOpen);
   // Restore directory breadcrumb after closing file preview
   if(typeof renderBreadcrumb==='function') renderBreadcrumb();
-  const closePanelAfter=_workspacePanelMode==='preview';
+  const closePanelAfter=_workspacePanelMode==='preview'&&!keepPanelOpen;
   const pa=$('previewArea');if(pa)pa.classList.remove('visible');
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
   const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
@@ -834,6 +895,7 @@ function clearPreview(){
   const ft=$('fileTree');if(ft)ft.style.display='';
   _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
   if(closePanelAfter)closeWorkspacePanel();
+  else if(keepPanelOpen&&_workspacePanelMode==='preview')openWorkspacePanel('browse');
   else syncWorkspacePanelUI();
 }
 $('btnClearPreview').onclick=handleWorkspaceClose;
@@ -870,6 +932,11 @@ $('modelSelect').onchange=async()=>{
 $('msg').addEventListener('input',()=>{
   autoResize();
   updateSendBtn();
+  // Persist composer draft to server (debounced in _saveComposerDraft).
+  const sid = S && S.session && S.session.session_id;
+  if (sid && typeof _saveComposerDraft === 'function') {
+    _saveComposerDraft(sid, $('msg').value, S.pendingFiles ? [...S.pendingFiles] : []);
+  }
   const text=$('msg').value;
   if(text.startsWith('/')&&text.indexOf('\n')===-1){
     if(typeof getSlashAutocompleteMatches==='function'){
@@ -941,6 +1008,18 @@ $('msg').addEventListener('keydown',e=>{
 });
 // B14: Cmd/Ctrl+K creates a new chat from anywhere
 document.addEventListener('keydown',async e=>{
+  // Cmd/Ctrl+B toggles desktop sidebar collapse (VS Code convention).
+  // Skip when typing in an input/textarea/contenteditable so text-edit
+  // shortcuts (e.g. bold in some embedded editors) are never stolen.
+  if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&!e.altKey&&(e.key==='b'||e.key==='B')){
+    const t=e.target;
+    const isText=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
+    if(!isText&&typeof toggleSidebar==='function'&&_isDesktopWidth()){
+      e.preventDefault();
+      toggleSidebar();
+      return;
+    }
+  }
   // Enter on approval card = Allow once (when a button inside the card is focused or
   // card is visible and focus is not on an input/textarea/select)
   if(e.key==='Enter'&&!e.metaKey&&!e.ctrlKey&&!e.shiftKey){
@@ -970,7 +1049,11 @@ document.addEventListener('keydown',async e=>{
     // a long generation to finish before they could start something new — exactly
     // the moment they want to switch context. newSession() leaves the in-flight
     // stream running on its own session; the user just gets a fresh blank one.
-    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+    try{
+      await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+    }catch(err){
+      if(typeof showToast==='function') showToast('Failed to start new conversation: '+(err&&err.message||err),3000,'error');
+    }
   }
   if(e.key==='Escape'){
     // Close onboarding overlay if open (skip/dismiss the wizard)
@@ -1093,6 +1176,8 @@ const _SKINS=[
   {name:'Sisyphus', colors:['#A78BFA','#8B5CF6','#7C3AED']},
   {name:'Charizard',colors:['#FB923C','#F97316','#EA580C']},
   {name:'Sienna',   colors:['#D97757','#C06A49','#9A523A']},
+  {name:'Claude',   colors:['#D97757','#E5D8C7','#2E2A24']},
+  {name:'Nebula',   colors:['#22D3EE','#3B82F6','#8B5CF6']},
 ];
 const _VALID_THEMES=new Set((_THEMES||[]).map(t=>t.value));
 const _VALID_SKINS=new Set((_SKINS||[]).map(s=>s.name.toLowerCase()));
@@ -1128,10 +1213,17 @@ function _normalizeAppearance(theme,skin){
 // the meta tag.
 function _syncThemeColorMeta(){
   try{
-    const meta=document.getElementById('hermes-theme-color');
-    if(!meta) return;
     const bg=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
-    if(bg) meta.setAttribute('content',bg);
+    if(!bg) return;
+    const known=document.getElementById('hermes-theme-color');
+    if(known){
+      known.setAttribute('content',bg);
+      known.removeAttribute('media');
+    }
+    document.querySelectorAll('meta[name="theme-color"]').forEach(meta=>{
+      meta.setAttribute('content',bg);
+      meta.removeAttribute('media');
+    });
   }catch(e){}
 }
 
@@ -1301,11 +1393,13 @@ function applyBotName(){
     window._simplifiedToolCalling=s.simplified_tool_calling!==false;
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
     window._busyInputMode=(s.busy_input_mode||'queue');
+    window._sessionEndlessScrollEnabled=!!s.session_endless_scroll;
     window._botName=s.bot_name||'Hermes';
     if(s.default_model) window._defaultModel=s.default_model;
     // Persist default workspace so the blank new-chat page can show it
     // and workspace actions (New file/folder) work before the first session (#804).
     if(s.default_workspace) S._profileDefaultWorkspace=s.default_workspace;
+    window._sessionJumpButtonsEnabled=!!s.session_jump_buttons;
     const appearance=_normalizeAppearance(s.theme,s.skin);
     localStorage.setItem('hermes-theme',appearance.theme);
     _applyTheme(appearance.theme);
@@ -1333,8 +1427,10 @@ function applyBotName(){
     window._notificationsEnabled=false;
     window._showThinking=true;
     window._simplifiedToolCalling=true;
+    window._sessionJumpButtonsEnabled=false;
     window._sidebarDensity='compact';
     window._busyInputMode='queue';
+    window._sessionEndlessScrollEnabled=false;
     window._botName='Hermes';
     _bootSettings={check_for_updates:false};
     if(typeof setLocale==='function'){
@@ -1508,4 +1604,14 @@ window.addEventListener('pageshow', async (event) => {
   }
   // Restart the gateway SSE watcher — the persisted connection is dead after bfcache
   if (typeof startGatewaySSE === 'function') try { startGatewaySSE(); } catch (_) {}
+  // Re-sync sidebar collapse state from localStorage. bfcache restored the
+  // frozen DOM but another tab may have toggled the sidebar in the meantime.
+  if (typeof _isSidebarCollapsed === 'function' && typeof toggleSidebar === 'function') {
+    try {
+      const _want = localStorage.getItem('hermes-webui-sidebar-collapsed') === '1';
+      const _have = _isSidebarCollapsed();
+      if (_want !== _have) toggleSidebar(_want);
+      if (typeof _syncSidebarAria === 'function') _syncSidebarAria();
+    } catch (_) {}
+  }
 });

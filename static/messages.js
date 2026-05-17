@@ -32,6 +32,19 @@ function _markActiveSessionViewedOnReturn() {
   if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
 }
 
+function _deferStreamErrorIfOffline(){
+  if(typeof isOfflineBannerVisible==='function' && isOfflineBannerVisible()){
+    setComposerStatus(t('offline_stream_waiting'));
+    return true;
+  }
+  if(typeof showOfflineBanner==='function' && navigator.onLine===false){
+    showOfflineBanner('browser');
+    setComposerStatus(t('offline_stream_waiting'));
+    return true;
+  }
+  return false;
+}
+
 document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);
 window.addEventListener('focus', _markActiveSessionViewedOnReturn);
 // TTS: pause speech synthesis when user focuses the composer (#499)
@@ -63,7 +76,7 @@ async function send(){
       // cmdSteer / cmdInterrupt say "No active task to stop."
       if(text.startsWith('/')){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
-        if(_pc&&['steer','interrupt','queue','terminal'].includes(_pc.name)){
+        if(_pc&&['steer','interrupt','queue','terminal','goal'].includes(_pc.name)){
           const _bc=COMMANDS.find(c=>c.name===_pc.name);
           if(_bc){
             $('msg').value='';autoResize();
@@ -153,6 +166,21 @@ async function send(){
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
+      if(_agentCmd&&_agentCmd.category==='Plugin'){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _pluginOutput='(no output)';
+        try{
+          _pluginOutput=typeof executeAgentPluginCommand==='function'
+            ? await executeAgentPluginCommand(text,_agentCmd)
+            : 'Plugin command runtime unavailable in WebUI.';
+        }catch(e){
+          _pluginOutput=`Plugin command error: ${e&&e.message||e}`;
+        }
+        S.messages.push({role:'assistant',content:String(_pluginOutput||'(no output)'),_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
     }
   }
   if(!S.session){await newSession();await renderSessionList();}
@@ -176,6 +204,8 @@ async function send(){
   if(!msgText){setComposerStatus('Nothing to send');return;}
 
   $('msg').value='';autoResize();
+  // Clear persisted composer draft since message was sent.
+  if (activeSid && typeof _clearComposerDraft === 'function') _clearComposerDraft(activeSid);
   const displayText=text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
@@ -195,6 +225,10 @@ async function send(){
   startClarifyPolling(activeSid);
   _fetchYoloState(activeSid);  // sync YOLO pill with backend state
   S.activeStreamId = null;  // will be set after stream starts
+  if(typeof updateSendBtn==='function') updateSendBtn();
+  // AbortController for the pre-stream window so Stop can cancel the pending request.
+  const _startAbort=new AbortController();
+  window._abortPendingChatStart=()=>{try{_startAbort.abort();}catch(_){}};
 
   // Set provisional title from user message immediately so session appears
   // in the sidebar right away with a meaningful name (server may refine later)
@@ -221,13 +255,14 @@ async function send(){
   // Start the agent via POST, get a stream_id back
   let streamId;
   try{
-    const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const startData=await api('/api/chat/start',{method:'POST',signal:_startAbort.signal,body:JSON.stringify({
       session_id:activeSid,message:msgText,
       model:S.session.model||$('modelSelect').value,workspace:S.session.workspace,
       model_provider:S.session.model_provider||null,
       profile:S.activeProfile||S.session.profile||'default',
       attachments:uploaded.length?uploaded:undefined
     })});
+
     if(startData.effective_model && S.session){
       S.session.model=startData.effective_model;
       S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
@@ -244,6 +279,11 @@ async function send(){
     }
     streamId=startData.stream_id;
     S.activeStreamId = streamId;
+    window._abortPendingChatStart=null;  // pre-stream window closed
+    // setBusy(true) already ran with activeStreamId=null; updateSendBtn is now a
+    // no-op since the button already shows stop (pre-stream gap fix), but keep the
+    // call so any other callers that read activeStreamId get the right state.
+    if(typeof updateSendBtn==='function') updateSendBtn();
     if(S.session&&typeof startData.pending_started_at==='number'){
       S.session.pending_started_at=startData.pending_started_at;
     }
@@ -265,6 +305,16 @@ async function send(){
       void renderSessionList();
     }
   }catch(e){
+    // Abort = user clicked Stop during the pre-stream gap.  cancelStream() already
+    // cleared S.busy and removed the thinking indicator; just clean up INFLIGHT.
+    if(e&&e.name==='AbortError'){
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      stopApprovalPolling();stopClarifyPolling();
+      if(typeof renderSessionList==='function') void renderSessionList();
+      return;
+    }
+    window._abortPendingChatStart=null;
     const errMsg=String((e&&e.message)||'');
     const conflictActiveStream=/session already has an active stream/i.test(errMsg);
     if(conflictActiveStream){
@@ -336,6 +386,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let assistantText='';
   let reasoningText='';
   let liveReasoningText='';
+  let _latestGoalStatus=null;
+  let _pendingGoalContinuation=null;
   let assistantRow=null;
   let assistantBody=null;
   let segmentStart=0;      // char offset in assistantText where current segment begins
@@ -367,11 +419,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return _clarifySessionId===activeSid||(!_clarifySessionId&&_isActiveSession());
   }
   function _clearApprovalForOwner(){
+    _clearApprovalPendingForSession(activeSid);
     if(!_approvalBelongsToOwner()) return;
     stopApprovalPolling();
     hideApprovalCard(true);
   }
   function _clearClarifyForOwner(reason){
+    _clearClarifyPendingForSession(activeSid);
     if(!_clarifyBelongsToOwner()) return;
     stopClarifyPolling();
     hideClarifyCard(true, reason||'terminal');
@@ -643,6 +697,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!_SMD_SAFE_URL_RE.test(v)){n.removeAttribute('src');n.setAttribute('data-blocked-scheme','1');}
     }
   }
+  function _resetAssistantSegment(){
+    assistantRow=null;
+    assistantBody=null;
+    segmentStart=assistantText.length;
+    _freshSegment=true;
+    _smdEndParser();
+  }
+
   let _lastRenderMs=0;
   function _scheduleRender(){
     if(_renderPending) return;
@@ -723,6 +785,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _scheduleRender();
     });
 
+    source.addEventListener('interim_assistant',e=>{
+      if(!S.session||S.session.session_id!==activeSid) return;
+      const d=JSON.parse(e.data);
+      const visible=String(d&&d.text?d.text:'').trim();
+      const alreadyStreamed=!!(d&&d.already_streamed);
+      if(!visible){
+        return;
+      }
+      if(alreadyStreamed){
+        _resetAssistantSegment();
+        return;
+      }
+      assistantText+=visible;
+      syncInflightAssistantMessage();
+      if(!S.session||S.session.session_id!==activeSid) return;
+      const parsed=_parseStreamState();
+      if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();
+      _scheduleRender();
+    });
+
     source.addEventListener('reasoning',e=>{
       const d=JSON.parse(e.data);
       reasoningText += d.text || '';
@@ -766,11 +848,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Reset the live assistant row reference so that any text tokens arriving
       // after this tool call create a NEW segment appended below the tool card,
       // rather than updating the old segment that sits above it in the DOM.
-      assistantRow=null;
-      assistantBody=null;
-      segmentStart=assistantText.length; // new segment starts at current text length
-      _freshSegment=true;                // prevent reuse of old DOM node
-      _smdEndParser();                   // finalize current smd parser; new one created on next token
+      _freshSegment=true;
+      _smdEndParser();
+      _resetAssistantSegment();
       scrollIfPinned();
     });
 
@@ -806,16 +886,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('approval',e=>{
       const d=JSON.parse(e.data);
-      d._session_id=activeSid;
-      showApprovalCard(d, 1);
+      showApprovalForSession(activeSid, d, 1);
       playNotificationSound();
       sendBrowserNotification('Approval required',d.description||'Tool approval needed');
     });
 
     source.addEventListener('clarify',e=>{
       const d=JSON.parse(e.data);
-      d._session_id=activeSid;
-      showClarifyCard(d);
+      showClarifyForSession(activeSid, d);
       playNotificationSound();
       sendBrowserNotification('Clarification needed',d.question||'Tool clarification needed');
     });
@@ -850,6 +928,56 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           raw_preview:String(d.raw_preview||''),
           session_id:String(d.session_id||activeSid)
         });
+      }catch(_){}
+    });
+
+    function _resolveGoalMessage(d){
+      const key=String(d && d.message_key ? d.message_key : '').trim();
+      const args=Array.isArray(d && d.message_args) ? d.message_args : [];
+      const raw=String(d&&d.message||'').trim();
+      if(key && typeof t==='function'){
+        try{
+          const translated=String(t(key,...args));
+          if(translated && translated!==key)return translated;
+        }catch(_){}
+      }
+      return raw;
+    }
+
+    source.addEventListener('goal',e=>{
+      try{
+        const d=JSON.parse(e.data||'{}');
+        if((d.session_id||activeSid)!==activeSid) return;
+        const goalState=String(d.state||'').trim();
+        const goalEvaluatingMessage=t('goal_evaluating_progress');
+        if(goalState==='evaluating'){
+          setComposerStatus(goalEvaluatingMessage);
+          return;
+        }
+        const msg=_resolveGoalMessage(d);
+        if(!msg)return;
+        _latestGoalStatus={message:msg,decision:d.decision||null,state:goalState||null};
+        setComposerStatus(msg);
+        showToast(msg.split('\n')[0],2600);
+      }catch(_){}
+    });
+
+    source.addEventListener('goal_continue',e=>{
+      try{
+        const d=JSON.parse(e.data||'{}');
+        const sid=d.session_id||activeSid;
+        const continuation_prompt=String(d.continuation_prompt||d.text||'').trim();
+        if(!continuation_prompt||sid!==activeSid)return;
+        _pendingGoalContinuation={
+          sid,
+          text:continuation_prompt,
+          model:S.session&&S.session.model||'',
+          model_provider:S.session&&S.session.model_provider||null,
+          profile:S.activeProfile||'default',
+        };
+        const toast=t('goal_continuing_toast');
+        const cmsg=_resolveGoalMessage(d);
+        showToast((toast&&cmsg&&cmsg!==toast)?cmsg.split('\n')[0]:toast,2200);
       }catch(_){}
     });
 
@@ -889,6 +1017,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
+      const shouldFollowOnDone=isActiveSession&&((typeof _shouldFollowMessagesOnDomReplace==='function')
+        ? _shouldFollowMessagesOnDomReplace()
+        : (typeof _isMessagePaneNearBottom==='function'&&_isMessagePaneNearBottom(1200)));
       if(isActiveSession){
         S.activeStreamId=null;
       }
@@ -963,14 +1094,37 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const lastUser=[...S.messages].reverse().find(m=>m.role==='user');
           if(lastUser)lastUser.attachments=uploaded;
         }
+        if(_latestGoalStatus&&_latestGoalStatus.message){
+          S.messages.push({
+            role:'assistant',
+            content:String(_latestGoalStatus.message),
+            _ts:Date.now()/1000,
+            _goalStatus:true,
+            _transient:true,
+          });
+        }
         clearLiveToolCards();
         S.busy=false;
         // No-reply guard (#373): if agent returned nothing, show inline error
         if(!S.messages.some(m=>m.role==='assistant'&&String(m.content||'').trim())&&!assistantText){removeThinking();S.messages.push({role:'assistant',content:'**No response received.** Check your API key and model selection.'});}
         if(isSessionViewed) _markSessionViewed(completedSid, completedSession.message_count ?? S.messages.length);
-        syncTopbar();renderMessages({preserveScroll:true});loadDir('.');
+        syncTopbar();renderMessages({preserveScroll:true});
+        if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
+        loadDir('.');
         // TTS auto-read: speak the last assistant response if enabled (#499)
         if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
+      }
+      if(isActiveSession&&_pendingGoalContinuation&&typeof queueSessionMessage==='function'){
+        const _goalNext=_pendingGoalContinuation;
+        _pendingGoalContinuation=null;
+        queueSessionMessage(_goalNext.sid,{
+          text:_goalNext.text,
+          files:[],
+          model:_goalNext.model,
+          model_provider:_goalNext.model_provider,
+          profile:_goalNext.profile,
+        });
+        if(typeof updateQueueBadge==='function')updateQueueBadge(_goalNext.sid);
       }
       if(isActiveSession) _queueDrainSid=activeSid;
       renderSessionList();
@@ -1011,6 +1165,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     });
 
+    source.addEventListener('compressing',e=>{
+      // Context auto-compression is starting. Surface the same calm running
+      // compression card as manual /compress while the summarizer LLM call runs.
+      if(!S.session||S.session.session_id!==activeSid) return;
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      if(d.session_id&&d.session_id!==activeSid) return;
+      if(typeof setCompressionUi==='function'){
+        setCompressionUi({
+          sessionId:activeSid,
+          phase:'running',
+          automatic:true,
+          message:d.message||'Auto-compressing context...',
+        });
+      }
+      if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+    });
+
     source.addEventListener('compressed',e=>{
       // Context was auto-compressed during this turn. Render it through the
       // same transient compression-card path as manual /compress, without
@@ -1030,13 +1202,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
       if(!S.busy&&typeof renderMessages==='function') renderMessages();
-      showToast(message||'Context compressed');
+      showToast(message||'Context compressed', 8000);
     });
 
     source.addEventListener('metering',e=>{
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
+        if(d.usage&&typeof _syncCtxIndicator==='function'){
+          S.lastUsage={...(S.lastUsage||{}),...d.usage};
+          _syncCtxIndicator(S.lastUsage);
+        }
         if(d.estimated===true||d.tps_available!==true||typeof d.tps!=='number'||d.tps<=0){
           if(typeof _setLiveAssistantTps==='function') _setLiveAssistantTps(null);
           return;
@@ -1100,6 +1276,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('error',async e=>{
       source.close();
+      if(_deferStreamErrorIfOffline()) return;
       if(_terminalStateReached || _streamFinalized){
         _closeSource();
         return;
@@ -1116,13 +1293,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
-          }catch(_){}
+          }catch(_){
+            if(_deferStreamErrorIfOffline()) return;
+          }
           if(await _restoreSettledSession()) return;
+          if(_deferStreamErrorIfOffline()) return;
           _handleStreamError();
         },1500);
         return;
       }
       if(await _restoreSettledSession()) return;
+      if(_deferStreamErrorIfOffline()) return;
       _handleStreamError();
     });
 
@@ -1383,8 +1564,50 @@ function hideApprovalCard(force=false) {
 // Track session_id of the active approval so respond goes to the right session
 let _approvalSessionId = null;
 let _approvalCurrentId = null;  // approval_id of the card currently shown
+let _approvalPendingBySession = new Map();
+
+function _promptActiveSessionId() {
+  return (S.session && S.session.session_id) || null;
+}
+
+function _approvalPromptBelongsToActiveSession(sid) {
+  return !!(sid && _promptActiveSessionId() === sid);
+}
+
+function _rememberApprovalPending(pending, pendingCount) {
+  if (!pending) return null;
+  const sid = pending._session_id || _promptActiveSessionId();
+  if (!sid) return null;
+  const nextPending = {...pending, _session_id: sid};
+  _approvalPendingBySession.set(sid, {pending: nextPending, pendingCount: pendingCount || 1});
+  return sid;
+}
+
+function _clearApprovalPendingForSession(sid) {
+  if (sid) _approvalPendingBySession.delete(sid);
+}
+
+function _hideApprovalCardIfOwner(sid, force=false) {
+  if (!sid || _approvalSessionId === sid) hideApprovalCard(force);
+}
+
+function _renderPendingApprovalForActiveSession() {
+  const sid = _promptActiveSessionId();
+  if (!sid) return;
+  if (_approvalSessionId && _approvalSessionId !== sid) hideApprovalCard(true);
+  const entry = _approvalPendingBySession.get(sid);
+  if (entry) showApprovalCard(entry.pending, entry.pendingCount);
+}
+
+function showApprovalForSession(sid, pending, pendingCount) {
+  if (!pending) return;
+  pending._session_id = sid;
+  showApprovalCard(pending, pendingCount);
+}
 
 function showApprovalCard(pending, pendingCount) {
+  const sid = _rememberApprovalPending(pending, pendingCount);
+  if (!_approvalPromptBelongsToActiveSession(sid)) return;
   const keys = pending.pattern_keys || (pending.pattern_key ? [pending.pattern_key] : []);
   const desc = (pending.description || "") + (keys.length ? " [" + keys.join(", ") + "]" : "");
   const cmd = pending.command || "";
@@ -1393,7 +1616,7 @@ function showApprovalCard(pending, pendingCount) {
   const sameApproval = card.classList.contains("visible") && _approvalSignature === sig;
   $("approvalDesc").textContent = desc;
   $("approvalCmd").textContent = cmd;
-  _approvalSessionId = pending._session_id || (S.session && S.session.session_id) || null;
+  _approvalSessionId = sid;
   _approvalCurrentId = pending.approval_id || null;
   _approvalSignature = sig;
   // Show "1 of N" counter when multiple approvals are queued
@@ -1431,6 +1654,7 @@ async function respondApproval(choice) {
   });
   _approvalSessionId = null;
   _approvalCurrentId = null;
+  _clearApprovalPendingForSession(sid);
   hideApprovalCard(true);
   try {
     await api("/api/approval/respond", {
@@ -1450,14 +1674,14 @@ function startApprovalPolling(sid) {
 
     es.addEventListener('initial', e => {
       const d = JSON.parse(e.data);
-      if (d.pending) { d.pending._session_id = sid; showApprovalCard(d.pending, d.pending_count || 1); }
-      else { hideApprovalCard(); }
+      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
+      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
     });
 
     es.addEventListener('approval', e => {
       const d = JSON.parse(e.data);
-      if (d.pending) { d.pending._session_id = sid; showApprovalCard(d.pending, d.pending_count || 1); }
-      else { hideApprovalCard(); }
+      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
+      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
     });
 
     es.onerror = () => {
@@ -1472,7 +1696,7 @@ function startApprovalPolling(sid) {
     // We detect this via a periodic check (cheap — no network request).
     _approvalSSEHealthTimer = setInterval(() => {
       if (!S.busy || !S.session || S.session.session_id !== sid) {
-        stopApprovalPolling(); hideApprovalCard(true);
+        stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true);
       }
     }, 5000);
 
@@ -1490,12 +1714,12 @@ let _approvalPollingSessionId = null;
 function _startApprovalFallbackPoll(sid) {
   _approvalPollTimer = setInterval(async () => {
     if (!S.busy || !S.session || S.session.session_id !== sid) {
-      stopApprovalPolling(); hideApprovalCard(true); return;
+      stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true); return;
     }
     try {
       const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid));
-      if (data.pending) { data.pending._session_id=sid; showApprovalCard(data.pending, data.pending_count||1); }
-      else { hideApprovalCard(); }
+      if (data.pending) { showApprovalForSession(sid, data.pending, data.pending_count||1); }
+      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
     } catch(e) { /* ignore poll errors */ }
   }, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
 }
@@ -1521,7 +1745,48 @@ let _clarifySessionId = null;
 let _clarifyMissingEndpointWarned = false;
 let _clarifyCountdownTimer = null;
 let _clarifyExpiresAt = 0;
+let _clarifyPendingBySession = new Map();
 const CLARIFY_MIN_VISIBLE_MS = 30000;
+
+function _clarifyPromptBelongsToActiveSession(sid) {
+  return !!(sid && _promptActiveSessionId() === sid);
+}
+
+function _rememberClarifyPending(pending) {
+  if (!pending) return null;
+  const sid = pending._session_id || _promptActiveSessionId();
+  if (!sid) return null;
+  const nextPending = {...pending, _session_id: sid};
+  _clarifyPendingBySession.set(sid, {pending: nextPending});
+  return sid;
+}
+
+function _clearClarifyPendingForSession(sid) {
+  if (sid) _clarifyPendingBySession.delete(sid);
+}
+
+function _hideClarifyCardIfOwner(sid, force=false, reason="dismissed") {
+  if (!sid || _clarifySessionId === sid) hideClarifyCard(force, reason);
+}
+
+function _renderPendingClarifyForActiveSession() {
+  const sid = _promptActiveSessionId();
+  if (!sid) return;
+  if (_clarifySessionId && _clarifySessionId !== sid) hideClarifyCard(true, 'session');
+  const entry = _clarifyPendingBySession.get(sid);
+  if (entry) showClarifyCard(entry.pending);
+}
+
+function showClarifyForSession(sid, pending) {
+  if (!pending) return;
+  pending._session_id = sid;
+  showClarifyCard(pending);
+}
+
+function _renderPendingPromptsForActiveSession() {
+  _renderPendingApprovalForActiveSession();
+  _renderPendingClarifyForActiveSession();
+}
 
 function _ensureClarifyCardDom() {
   let card = $("clarifyCard");
@@ -1698,6 +1963,8 @@ function _clarifySetControlsDisabled(disabled, loading=false) {
 }
 
 function showClarifyCard(pending) {
+  const sid = _rememberClarifyPending(pending);
+  if (!_clarifyPromptBelongsToActiveSession(sid)) return;
   const question = pending.question || pending.description || '';
   const choices = Array.isArray(pending.choices_offered)
     ? pending.choices_offered
@@ -1713,7 +1980,7 @@ function showClarifyCard(pending) {
   const choicesEl = $("clarifyChoices");
   const input = $("clarifyInput");
   const sameClarify = card.classList.contains("visible") && _clarifySignature === sig;
-  _clarifySessionId = pending._session_id || (S.session && S.session.session_id) || null;
+  _clarifySessionId = sid;
   _clarifySignature = sig;
   _startClarifyCountdown(pending);
   if (!sameClarify) {
@@ -1794,6 +2061,7 @@ async function respondClarify(response) {
     return;
   }
   _clarifySessionId = null;
+  _clearClarifyPendingForSession(sid);
   _clarifySetControlsDisabled(true, true);
   hideClarifyCard(true, 'sent');
   try {
@@ -1825,16 +2093,16 @@ function startClarifyPolling(sid) {
   _clarifyEventSource.addEventListener('initial', function(ev) {
     try {
       var d = JSON.parse(ev.data);
-      if (d.pending) { d.pending._session_id = sid; showClarifyCard(d.pending); }
-      else { hideClarifyCard(false, 'expired'); }
+      if (d.pending) { showClarifyForSession(sid, d.pending); }
+      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
     } catch(e) {}
   });
 
   _clarifyEventSource.addEventListener('clarify', function(ev) {
     try {
       var d = JSON.parse(ev.data);
-      if (d.pending) { d.pending._session_id = sid; showClarifyCard(d.pending); }
-      else { hideClarifyCard(false, 'expired'); }
+      if (d.pending) { showClarifyForSession(sid, d.pending); }
+      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
     } catch(e) {}
   });
 
@@ -1871,12 +2139,12 @@ function startClarifyPolling(sid) {
 function _startClarifyFallbackPoll(sid) {
   _clarifyFallbackTimer = setInterval(async () => {
     if (!S.session || S.session.session_id !== sid) {
-      stopClarifyPolling(); hideClarifyCard(true, 'session'); return;
+      stopClarifyPolling(); _hideClarifyCardIfOwner(sid, true, 'session'); return;
     }
     try {
       const data = await api("/api/clarify/pending?session_id=" + encodeURIComponent(sid));
-      if (data.pending) { data.pending._session_id=sid; showClarifyCard(data.pending); }
-      else { hideClarifyCard(false, 'expired'); }
+      if (data.pending) { showClarifyForSession(sid, data.pending); }
+      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
     } catch(e) {
       const msg = String((e && e.message) || "");
       if (!_clarifyMissingEndpointWarned && /(^|\b)(404|not found)(\b|$)/i.test(msg)) {

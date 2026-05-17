@@ -2,7 +2,7 @@
 
 > Web companion to the Hermes Agent CLI. Same workflows, browser-native.
 >
-> Last updated: v0.51.17 (May 7, 2026) — 4723 tests collected — 2-PR contributor batch (#1780, #1782)
+> Last updated: v0.51.31 (May 9, 2026) — 5028 tests collected — Release H 12-PR contributor batch (image-mode fix + race fixes + composer drafts + locale parity + custom-provider dedup + TTL config + heartbeat polish)
 > Test source: `pytest tests/ --collect-only -q`
 > Per-version detail: see [CHANGELOG.md](./CHANGELOG.md)
 
@@ -168,7 +168,7 @@ Remaining gaps and forward work live in [Forward Work](#forward-work) below.
 
 ### Slash commands
 - [x] Command registry + autocomplete dropdown
-- [x] Built-ins: `/help`, `/clear`, `/model`, `/workspace`, `/new`, `/usage`, `/theme`, `/compact`, `/queue`, `/interrupt`, `/steer`, `/btw`, `/reasoning`, `/skills`, `/toolsets`
+- [x] Built-ins: `/help`, `/clear`, `/model`, `/workspace`, `/new`, `/usage`, `/theme`, `/compact`, `/queue`, `/interrupt`, `/steer`, `/goal`, `/btw`, `/reasoning`, `/skills`, `/toolsets`
 - [x] Transparent pass-through for unrecognized commands
 
 ### Security

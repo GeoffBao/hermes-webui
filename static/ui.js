@@ -6334,11 +6334,8 @@ function finalizeThinkingCard(){
   }
 }
 function appendThinking(text=''){
-  // Guard: ignore if session was switched during an async SSE stream.
-  // The old stream's reasoning events can still fire after switch;
-  // without this check they would pollute the new session's DOM.
+  // Guard: ignore if no active session (e.g. switched away before stream start).
   if(!S.session) return;
-  if(!S.activeStreamId) return;
   $('emptyState').style.display='none';
   let turn=$('liveAssistantTurn');
   if(!turn){

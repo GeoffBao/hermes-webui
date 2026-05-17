@@ -842,7 +842,11 @@ $('btnNewChat').onclick=async()=>{
      && !S.session.pending_user_message){
     $('msg').focus();closeMobileSidebar();return;
   }
-  await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+  try{
+    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+  }catch(err){
+    if(typeof showToast==='function') showToast('Failed to start new conversation: '+(err&&err.message||err),3000,'error');
+  }
 };
 $('btnDownload').onclick=()=>{
   if(!S.session)return;
@@ -1027,7 +1031,7 @@ document.addEventListener('keydown',async e=>{
       return;
     }
   }
-  if((e.metaKey||e.ctrlKey)&&e.key==='k'){
+  if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){
     e.preventDefault();
     // If the current session has no messages AND nothing is in flight, just focus
     // the composer rather than creating another empty session that will clutter
@@ -1045,7 +1049,11 @@ document.addEventListener('keydown',async e=>{
     // a long generation to finish before they could start something new — exactly
     // the moment they want to switch context. newSession() leaves the in-flight
     // stream running on its own session; the user just gets a fresh blank one.
-    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+    try{
+      await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+    }catch(err){
+      if(typeof showToast==='function') showToast('Failed to start new conversation: '+(err&&err.message||err),3000,'error');
+    }
   }
   if(e.key==='Escape'){
     // Close onboarding overlay if open (skip/dismiss the wizard)

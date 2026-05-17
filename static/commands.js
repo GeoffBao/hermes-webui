@@ -31,6 +31,7 @@ const COMMANDS=[
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh', subArgs:['show','hide','none','minimal','low','medium','high','xhigh'], noEcho:true},
   {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
+  {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
 ];
 
 const SLASH_SUBARG_SOURCES={
@@ -100,6 +101,22 @@ let _slashPersonalityCachePromise=null;
 let _agentCommandCache=null;
 let _agentCommandCachePromise=null;
 
+// Invalidate the /api/models slash-suggestion cache. Called by panels.js
+// after a provider is added or removed so the next /model autocomplete
+// rebuilds from a fresh /api/models response (#1539). Returning a function
+// rather than letting callers poke the module-local lets/promises directly
+// keeps the cache shape encapsulated to this module.
+function _invalidateSlashModelCache(){
+  _slashModelCache=null;
+  _slashModelCachePromise=null;
+}
+// Expose on window when available. Guarded by typeof so the module is
+// importable in headless test contexts (vm.runInContext) that don't
+// define a window global — see tests/test_cli_only_slash_commands.py.
+if(typeof window!=='undefined'){
+  window._invalidateSlashModelCache=_invalidateSlashModelCache;
+}
+
 function _normalizeSlashSubArg(value){
   return String(value||'').trim();
 }
@@ -129,6 +146,15 @@ async function _loadSlashModelSubArgs(force=false){
       const values=[];
       for(const group of (data&&data.groups)||[]){
         for(const model of (group&&group.models)||[]){
+          const id=_normalizeSlashSubArg(model&&model.id);
+          if(id) values.push(id);
+        }
+        // Include extra_models (the catalog tail that doesn't render as
+        // <option> entries when the picker is capped) so /model autocomplete
+        // covers the full catalog. The trimming is purely a dropdown
+        // scannability concern — the slash command exists precisely so
+        // power users can reach any model by typing its name. #1567.
+        for(const model of (group&&group.extra_models)||[]){
           const id=_normalizeSlashSubArg(model&&model.id);
           if(id) values.push(id);
         }
@@ -356,6 +382,134 @@ async function cmdNew(){
   showToast(t('new_session'));
 }
 
+function _manualCompressionVisibleMessages(){
+  return (S.messages||[]).filter(m=>{
+    if(!m||!m.role||m.role==='tool') return false;
+    if(m.role==='assistant'){
+      const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+      const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+      if(hasTc||hasTu|| (typeof _messageHasReasoningPayload==='function' && _messageHasReasoningPayload(m))) return true;
+    }
+    return typeof msgContent==='function' ? !!msgContent(m) || !!m.attachments?.length : !!m.content || !!m.attachments?.length;
+  });
+}
+
+function _manualCompressionSleep(ms){
+  return new Promise(resolve=>setTimeout(resolve, ms));
+}
+
+async function _pollManualCompressionResult(sid){
+  let delay=700;
+  while(true){
+    const data=await api(`/api/session/compress/status?session_id=${encodeURIComponent(sid)}`);
+    if(data&&data.status==='done') return data;
+    if(data&&data.status==='error'){
+      const err=new Error(data.error||'Compression failed');
+      err.status=data.error_status||400;
+      throw err;
+    }
+    if(data&&data.status==='idle') throw new Error('Compression job is no longer available');
+    await _manualCompressionSleep(delay);
+    delay=Math.min(2000, delay+300);
+  }
+}
+
+async function _applyManualCompressionResult(data, focusTopic, visibleCount, commandText){
+  if(data&&data.session){
+    const currentSid=S.session&&S.session.session_id;
+    if(data.session.session_id&&data.session.session_id!==currentSid){
+      await loadSession(data.session.session_id);
+    }else{
+      S.session=data.session;
+      S.messages=data.session.messages||[];
+      S.toolCalls=data.session.tool_calls||[];
+      clearLiveToolCards();
+      try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
+      if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
+      syncTopbar();
+      renderMessages();
+      await renderSessionList();
+      updateQueueBadge(S.session.session_id);
+    }
+  }
+  const summary=data&&data.summary;
+  if(typeof setCompressionUi==='function'&&S.session){
+    const referenceMsg=(S.messages||[]).find(m=>typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(m));
+    const messageRef=referenceMsg?msgContent(referenceMsg)||String(referenceMsg.content||''):'';
+    const summaryRef=summary&&typeof summary.reference_message==='string' ? String(summary.reference_message||'').trim() : '';
+    // Prefer the persisted compaction handoff when it already exists in session state.
+    // The short summary fallback is only for environments where that message is unavailable.
+    const referenceText=messageRef || summaryRef;
+    const effectiveFocus=(data&&data.focus_topic)||focusTopic||'';
+    setCompressionUi({
+      sessionId:S.session.session_id,
+      phase:'done',
+      focusTopic:effectiveFocus,
+      commandText:effectiveFocus?`/compress ${effectiveFocus}`:(commandText||'/compress'),
+      beforeCount:visibleCount,
+      summary:summary||null,
+      referenceText,
+      anchorVisibleIdx: data?.session?.compression_anchor_visible_idx,
+      anchorMessageKey: data?.session?.compression_anchor_message_key||null,
+    });
+  }
+  if(typeof setComposerStatus==='function') setComposerStatus('');
+  renderMessages();
+  if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+}
+
+async function resumeManualCompressionForSession(sid){
+  if(!sid) return;
+  try{
+    const status=await api(`/api/session/compress/status?session_id=${encodeURIComponent(sid)}`);
+    if(!status||status.status!=='running') return;
+    const visibleMessages=_manualCompressionVisibleMessages();
+    const visibleCount=visibleMessages.length;
+    const anchorMessageKey=_compressionAnchorMessageKey(visibleMessages[visibleMessages.length-1]||null);
+    if(typeof setBusy==='function') setBusy(true);
+    if(typeof setComposerStatus==='function') setComposerStatus(t('compressing'));
+    if(typeof setCompressionUi==='function'){
+      setCompressionUi({
+        sessionId:sid,
+        phase:'running',
+        focusTopic:status.focus_topic||'',
+        commandText:status.focus_topic?`/compress ${status.focus_topic}`:'/compress',
+        beforeCount:visibleCount,
+        anchorVisibleIdx:Math.max(0, visibleCount-1),
+        anchorMessageKey,
+      });
+    }
+    renderMessages();
+    const done=await _pollManualCompressionResult(sid);
+    if(!S.session||S.session.session_id!==sid) return;
+    await _applyManualCompressionResult(done, status.focus_topic||'', visibleCount, status.focus_topic?`/compress ${status.focus_topic}`:'/compress');
+  }catch(e){
+    // No active compression job or transient server error — not a real failure.
+    // 404: route missed or session gone; 5xx: backend exception during status check.
+    if(e&&(!e.status||e.status===404||e.status>=500)) return;
+    if(S.session&&S.session.session_id===sid&&typeof setCompressionUi==='function'){
+      const visibleMessages=_manualCompressionVisibleMessages();
+      setCompressionUi({
+        sessionId:sid,
+        phase:'error',
+        focusTopic:'',
+        commandText:'/compress',
+        beforeCount:visibleMessages.length,
+        errorText:`Compression failed: ${e.message}`,
+        anchorVisibleIdx:Math.max(0, visibleMessages.length-1),
+        anchorMessageKey:null,
+      });
+      renderMessages();
+    }
+  }finally{
+    if(S.session&&S.session.session_id===sid){
+      if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+      if(typeof setBusy==='function') setBusy(false);
+      if(typeof setComposerStatus==='function') setComposerStatus('');
+    }
+  }
+}
+
 async function _runManualCompression(focusTopic){
   if(!S.session){showToast(t('no_active_session'));return;}
   let visibleCount=0;
@@ -384,15 +538,7 @@ async function _runManualCompression(focusTopic){
     if(typeof setBusy==='function') setBusy(true);
     const body={session_id:sid};
     if(focusTopic) body.focus_topic=focusTopic;
-    const visibleMessages=(S.messages||[]).filter(m=>{
-      if(!m||!m.role||m.role==='tool') return false;
-      if(m.role==='assistant'){
-        const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-        const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-        if(hasTc||hasTu|| (typeof _messageHasReasoningPayload==='function' && _messageHasReasoningPayload(m))) return true;
-      }
-      return typeof msgContent==='function' ? !!msgContent(m) || !!m.attachments?.length : !!m.content || !!m.attachments?.length;
-    });
+    const visibleMessages=_manualCompressionVisibleMessages();
     visibleCount=visibleMessages.length;
     const anchorVisibleIdx=Math.max(0, visibleCount - 1);
     const anchorMessageKey=_compressionAnchorMessageKey(visibleMessages[visibleMessages.length-1]||null);
@@ -410,47 +556,14 @@ async function _runManualCompression(focusTopic){
     }
     if(typeof setComposerStatus==='function') setComposerStatus(t('compressing'));
     renderMessages();
-    const data=await api('/api/session/compress',{method:'POST',body:JSON.stringify(body)});
-    if(data&&data.session){
-      const currentSid=S.session&&S.session.session_id;
-      if(data.session.session_id&&data.session.session_id!==currentSid){
-        await loadSession(data.session.session_id);
-      }else{
-        S.session=data.session;
-        S.messages=data.session.messages||[];
-        S.toolCalls=data.session.tool_calls||[];
-        clearLiveToolCards();
-        localStorage.setItem('hermes-webui-session',S.session.session_id);
-        syncTopbar();
-        renderMessages();
-        await renderSessionList();
-        updateQueueBadge(S.session.session_id);
-      }
+    const started=await api('/api/session/compress/start',{method:'POST',body:JSON.stringify(body)});
+    if(started&&started.status==='error'){
+      const err=new Error(started.error||'Compression failed');
+      err.status=started.error_status||400;
+      throw err;
     }
-    const summary=data&&data.summary;
-    if(typeof setCompressionUi==='function'&&S.session){
-      const referenceMsg=(S.messages||[]).find(m=>typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(m));
-      const messageRef=referenceMsg?msgContent(referenceMsg)||String(referenceMsg.content||''):'';
-      const summaryRef=summary&&typeof summary.reference_message==='string' ? String(summary.reference_message||'').trim() : '';
-      // Prefer the persisted compaction handoff when it already exists in session state.
-      // The short summary fallback is only for environments where that message is unavailable.
-      const referenceText=messageRef || summaryRef;
-      const effectiveFocus=(data&&data.focus_topic)||focusTopic||'';
-      setCompressionUi({
-        sessionId:S.session.session_id,
-        phase:'done',
-        focusTopic:effectiveFocus,
-        commandText:effectiveFocus?`/compress ${effectiveFocus}`:'/compress',
-        beforeCount:visibleCount,
-        summary:summary||null,
-        referenceText,
-        anchorVisibleIdx: data?.session?.compression_anchor_visible_idx,
-        anchorMessageKey: data?.session?.compression_anchor_message_key||null,
-      });
-    }
-    if(typeof setComposerStatus==='function') setComposerStatus('');
-    renderMessages();
-    if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+    const data=(started&&started.status==='done')?started:await _pollManualCompressionResult(sid);
+    await _applyManualCompressionResult(data, focusTopic, visibleCount, commandText);
   }catch(e){
     if(typeof setCompressionUi==='function'){
       const currentSid=S.session&&S.session.session_id;
@@ -765,6 +878,26 @@ async function cmdSteer(args){
  * @param {boolean} explicitSteer - True if the user explicitly invoked /steer
  *   (vs the busy-mode auto-fallback). Affects toast wording only.
  */
+function _showSteerIndicator(text){
+  const inner=document.getElementById('msgInner');
+  if(!inner) return;
+  // Remove any existing steer indicator
+  const old=inner.querySelector('.steer-indicator');
+  if(old) old.remove();
+  const el=document.createElement('div');
+  el.className='steer-indicator';
+  const badge=document.createElement('span');
+  badge.className='steer-badge';
+  badge.textContent='Steer';
+  const body=document.createElement('span');
+  body.className='steer-body';
+  body.textContent=text.length>120?text.slice(0,117)+'…':text;
+  el.appendChild(badge);
+  el.appendChild(body);
+  inner.appendChild(el);
+  if(typeof scrollToBottom==='function') scrollToBottom();
+}
+
 async function _trySteer(msg, explicitSteer){
   let result=null;
   try{
@@ -777,6 +910,11 @@ async function _trySteer(msg, explicitSteer){
     result={accepted:false, fallback:'network_error'};
   }
   if(result&&result.accepted){
+    // Show a transient steer indicator in the chat (NOT in S.messages — it must
+    // survive the done event's S.messages=d.session.messages replacement).
+    // The indicator self-removes when the turn completes (done/cancel/error
+    // all call renderMessages which rebuilds msgInner).
+    _showSteerIndicator(msg);
     showToast(t('cmd_steer_delivered'),2500);
     return;
   }
@@ -874,35 +1012,67 @@ async function cmdBackground(args){
     if(typeof startBackgroundPolling==='function') startBackgroundPolling(activeSid,r.task_id,prompt);
   }catch(e){showToast(t('bg_failed')+e.message);}
 }
-async function cmdStatus(){
+function _formatStatusTimestamp(value){
+  if(value===undefined||value===null||value==='') return t('status_unknown');
+  let date;
+  if(typeof value==='number') date=new Date(value < 1000000000000 ? value*1000 : value);
+  else date=new Date(value);
+  if(Number.isNaN(date.getTime())) return t('status_unknown');
+  return date.toLocaleString();
+}
+function _formatStatusTokens(s){
+  const lastUsage=(typeof S!=='undefined'&&(S.lastUsage||s.last_usage))||{};
+  const input=Number(s.input_tokens??lastUsage.input_tokens??0)||0;
+  const output=Number(s.output_tokens??lastUsage.output_tokens??0)||0;
+  const total=Number(s.total_tokens??lastUsage.total_tokens??(input+output))||0;
+  const cost=Number(s.estimated_cost??lastUsage.estimated_cost??0)||0;
+  if(!total&&!cost) return t('status_no_tokens');
+  const fmtNum=n=>Number(n||0).toLocaleString();
+  return `${fmtNum(input)} in / ${fmtNum(output)} out${cost?` (~$${cost.toFixed(4)})`:''}`;
+}
+function _statusProviderForSession(s){
+  if(s.model_provider) return String(s.model_provider);
+  if(window._activeProvider) return String(window._activeProvider);
+  const model=String(s.model||'');
+  return model.includes('/') ? model.split('/')[0] : '';
+}
+function _statusCardFromSession(s){
+  const provider=_statusProviderForSession(s);
+  const model=s.model||(($('modelSelect')&&$('modelSelect').value)||t('usage_default_model'));
+  const running=!!(s.active_stream_id||S.activeStreamId||S.busy);
+  const profile=s.profile||S.activeProfile||'default';
+  const workspace=s.workspace||S.currentDir||t('status_unknown');
+  const rows=[
+    {label:t('status_session_id'), value:s.session_id||t('status_unknown')},
+    {label:t('status_title'), value:s.title||t('untitled')},
+    {label:t('status_model'), value:model},
+    {label:t('status_provider'), value:provider||t('status_unknown')},
+    {label:t('status_profile'), value:profile},
+    {label:t('status_workspace'), value:workspace},
+    {label:t('status_personality'), value:s.personality||t('usage_personality_none')},
+    {label:t('status_started'), value:_formatStatusTimestamp(s.created_at)},
+    {label:t('status_updated'), value:_formatStatusTimestamp(s.updated_at||s.last_message_at)},
+    {label:t('status_tokens'), value:_formatStatusTokens(s)},
+    {label:t('status_messages'), value:String(s.message_count??(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool').length)},
+    {label:t('status_agent_running'), value:running?t('status_yes'):t('status_no')},
+  ];
+  return {
+    title:t('status_heading'),
+    subtitle:t('status_ephemeral'),
+    sessionId:s.session_id||'',
+    rows,
+  };
+}
+function cmdStatus(){
   if(!S.session){showToast(t('no_active_session'));return;}
-  try{
-    const r=await api('/api/session/status?session_id='+encodeURIComponent(S.session.session_id));
-    if(r&&r.error){showToast(r.error);return;}
-    // Build status card lines matching CLI /status output
-    const provider=window._activeProvider||'';
-    const profile=r.profile||S.activeProfile||'default';
-    const started=r.created_at?new Date(r.created_at).toLocaleString():t('status_unknown');
-    const fmtNum=n=>typeof n==='number'?n.toLocaleString():'0';
-    const tokens=r.total_tokens?`${fmtNum(r.input_tokens)} in / ${fmtNum(r.output_tokens)} out`:t('status_no_tokens');
-    const cost=r.estimated_cost?` (~$${Number(r.estimated_cost).toFixed(4)})`:'';
-    const lines=[
-      `**${t('status_heading')}**`,'',
-      `\`${r.session_id}\``,'',
-      `**${t('status_title')}:** ${r.title||t('untitled')}`,
-      `**${t('status_model')}:** ${r.model||t('usage_default_model')}${provider?'  ('+provider+')':''}`,
-      `**${t('status_profile')}:** ${profile}`,
-      `**${t('status_hermes_home')}:** ${r.hermes_home||t('status_unknown')}`,
-      `**${t('status_workspace')}:** ${r.workspace}`,
-      `**${t('status_personality')}:** ${r.personality||t('usage_personality_none')}`,
-      `**${t('status_started')}:** ${started}`,
-      `**${t('status_tokens')}:** ${tokens}${cost}`,
-      `**${t('status_messages')}:** ${r.message_count}`,
-      `**${t('status_agent_running')}:** ${r.agent_running?t('status_yes'):t('status_no')}`,
-    ];
-    S.messages.push({role:'assistant',content:lines.join('\n')});
-    renderMessages();
-  }catch(e){showToast(t('status_load_failed')+e.message);}
+  S.messages.push({
+    role:'assistant',
+    content:'',
+    _ephemeral:true,
+    _statusCard:_statusCardFromSession(S.session),
+    _ts:Date.now()/1000,
+  });
+  renderMessages();
 }
 function cmdReasoning(args){
   const arg=(args||'').trim().toLowerCase();
@@ -983,6 +1153,64 @@ async function cmdYolo(){
       hideApprovalCard(true);
     }
   }catch(e){showToast('YOLO: '+e.message);}
+}
+
+// ── Branch / fork command ──
+// Forks the current conversation into a new session (#465).
+// /branch           → full history copy
+// /branch My Name   → full history copy with custom title
+async function cmdBranch(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const customTitle=(args||'').trim()||null;
+  try{
+    const data=await api('/api/session/branch',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:S.session.session_id,
+        title:customTitle||undefined,
+      }),
+    });
+    if(data&&data.session_id){
+      await loadSession(data.session_id);
+      if(typeof renderSessionList==='function') await renderSessionList();
+      showToast(t('branch_forked'));
+    }
+  }catch(e){showToast(t('branch_failed')+e.message);}
+}
+
+// ── Fork from a specific message point ──
+// Called from the "Fork from here" button on message hover actions.
+// msgIdx is 1-based within the currently loaded tail window (rawIdx+1).
+// When the session is truncated (_oldestIdx > 0), msgIdx alone would be
+// a local-window count, but the backend expects an absolute message count
+// from the beginning of the full transcript.  We capture the absolute
+// count (_oldestIdx + msgIdx) BEFORE awaiting _ensureAllMessagesLoaded,
+// which resets _oldestIdx to 0 after its wholesale replace.  See #2184.
+async function forkFromMessage(msgIdx){
+  if(!S.session||S.busy)return;
+  // Capture the absolute keep_count before any async work that may
+  // reset _oldestIdx.  _oldestIdx is 0 when the full transcript is
+  // already loaded, so short/already-full sessions send msgIdx unchanged.
+  const absoluteKeepCount = _oldestIdx + msgIdx;
+  // Ensure the full transcript is loaded so the forked session renders
+  // correctly and subsequent operations see the complete history.
+  if(typeof _ensureAllMessagesLoaded==='function'){
+    await _ensureAllMessagesLoaded();
+  }
+  try{
+    const data=await api('/api/session/branch',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:S.session.session_id,
+        keep_count:absoluteKeepCount,
+      }),
+    });
+    if(data&&data.session_id){
+      await loadSession(data.session_id);
+      if(typeof renderSessionList==='function') await renderSessionList();
+      showToast(t('branch_forked'));
+    }
+  }catch(e){showToast(t('branch_failed')+e.message);}
 }
 
 let _skillCommandCache=[];

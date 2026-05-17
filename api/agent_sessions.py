@@ -515,6 +515,10 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
         if not row:
             continue
 
+        state_title = str(row.get('title') or '').strip()
+        if state_title:
+            metadata.setdefault(sid, {})['_state_db_title'] = state_title
+
         parent_id = row.get('parent_session_id')
         # Only expose parent_session_id when:
         #   1) the parent actually exists in state.db (orphan refs would

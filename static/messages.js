@@ -210,9 +210,7 @@ async function send(){
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
-  // setBusy(true) BEFORE appendThinking() so the pre-stream gap shows the
-  // thinking dots immediately (appendThinking guards on S.busy||S.activeStreamId).
-  S.messages.push(userMsg);renderMessages();setBusy(true);appendThinking();
+  S.messages.push(userMsg);renderMessages();appendThinking();setBusy(true);
   // First optimistic pass: make the local user turn visible before /api/chat/start
   // can save pending state on the server.
   if(typeof upsertActiveSessionForLocalTurn==='function'){
@@ -226,7 +224,7 @@ async function send(){
   startApprovalPolling(activeSid);
   startClarifyPolling(activeSid);
   _fetchYoloState(activeSid);  // sync YOLO pill with backend state
-  S.activeStreamId = null;  // will be set after /api/chat/start responds
+  S.activeStreamId = null;  // will be set after stream starts
   // AbortController for the pre-stream window so Stop can cancel the pending request.
   const _startAbort=new AbortController();
   window._abortPendingChatStart=()=>{try{_startAbort.abort();}catch(_){}};

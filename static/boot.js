@@ -1,18 +1,6 @@
 async function cancelStream(){
   const streamId = S.activeStreamId;
-  if(!streamId){
-    // Pre-stream gap: /api/chat/start hasn't responded yet but S.busy is true.
-    // Abort the in-flight request (if an AbortController is wired up) and reset
-    // UI so the button and thinking indicator recover immediately.
-    if(typeof _abortPendingChatStart==='function') _abortPendingChatStart();
-    if(S.busy){
-      S.activeStreamId=null;
-      setBusy(false);
-      if(typeof removeThinking==='function') removeThinking();
-      if(typeof setComposerStatus==='function') setComposerStatus('');
-    }
-    return;
-  }
+  if(!streamId){if(typeof _abortPendingChatStart==='function')_abortPendingChatStart();if(S.busy)setBusy(false);return;}
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
   }catch(e){/* cancel request failed - cleanup below still runs */}
@@ -1043,7 +1031,7 @@ document.addEventListener('keydown',async e=>{
       return;
     }
   }
-  if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){
+  if((e.metaKey||e.ctrlKey)&&e.key==='k'){
     e.preventDefault();
     // If the current session has no messages AND nothing is in flight, just focus
     // the composer rather than creating another empty session that will clutter

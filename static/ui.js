@@ -6337,11 +6337,8 @@ function appendThinking(text=''){
   // Guard: ignore if session was switched during an async SSE stream.
   // The old stream's reasoning events can still fire after switch;
   // without this check they would pollute the new session's DOM.
-  // Exception: allow showing the thinking dots during the pre-stream gap
-  // (S.busy=true but S.activeStreamId not yet assigned) so users get
-  // immediate visual feedback on slow providers.
   if(!S.session) return;
-  if(!S.busy&&!S.activeStreamId) return;
+  if(!S.activeStreamId) return;
   $('emptyState').style.display='none';
   let turn=$('liveAssistantTurn');
   if(!turn){

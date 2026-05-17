@@ -228,8 +228,8 @@
   :root[data-skin="claude"] .msg-body h3{font-family:"Inter",ui-sans-serif,system-ui,sans-serif;letter-spacing:-0.015em;}
   :root[data-skin="claude"] .msg-row[data-role="user"] .msg-body{border-radius:16px;padding:12px 16px;}
   :root[data-skin="claude"] .msg-row[data-role="user"] .msg-body code{color:var(--user-bubble-text);background:rgba(20,19,17,0.08);}
-  :root[data-skin="claude"] .send-btn{box-shadow:0 1px 3px rgba(217,119,87,0.3);}
-  :root[data-skin="claude"] .send-btn:hover{box-shadow:0 2px 8px rgba(217,119,87,0.45);}
+  :root[data-skin="claude"] .send-btn {box-shadow:0 1px 3px rgba(217,119,87,0.3);}
+  :root[data-skin="claude"] .send-btn:hover {box-shadow:0 2px 8px rgba(217,119,87,0.45);}
   :root[data-skin="claude"] .session-item.active{border-left:2px solid var(--accent);}
   /* ── Skin: Nebula (cyan-blue-violet) ── */
   :root[data-skin="nebula"]{

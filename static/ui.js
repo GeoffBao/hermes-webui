@@ -3682,6 +3682,19 @@ function copyMsg(btn){
     setTimeout(()=>{btn.innerHTML=orig;btn.style.color='';},1500);
   }).catch(()=>showToast(t('copy_failed')));
 }
+function _copyThinkingText(btn){
+  const card=btn&&btn.closest?btn.closest('.thinking-card'):null;
+  if(!card)return;
+  const pre=card.querySelector('.thinking-card-body pre');
+  const text=pre?pre.textContent:'';
+  if(!text)return;
+  _copyText(text).then(()=>{
+    const orig=btn.innerHTML;
+    btn.innerHTML=li('check',12);
+    btn.style.color='var(--accent)';
+    setTimeout(()=>{btn.innerHTML=orig;btn.style.color='';},1500);
+  }).catch(()=>showToast(t('copy_failed')));
+}
 
 // ── TTS: Text-to-Speech via Web Speech API (#499) ──
 // Strips markdown, code blocks, and MEDIA: paths for clean speech output.
@@ -4106,8 +4119,11 @@ async function refreshSession() {
 // ── Update banner ──
 function _formatUpdateTargetStatus(label,info){
   if(!info||!(info.behind>0)) return null;
-  const branch=info.branch?` (${info.branch})`:'';
-  return `${label}${branch}: ${info.behind} update${info.behind>1?'s':''}`;
+  const release=(info.release_based&&info.latest_version)
+    ?` (${info.current_version||'unknown'} -> ${info.latest_version})`
+    :(info.branch?` (${info.branch})`:'');
+  const noun=info.release_based?'release':'update';
+  return `${label}${release}: ${info.behind} ${noun}${info.behind>1?'s':''}`;
 }
 function _isSafeUpdateCompareUrl(url){
   if(!url||!/^https?:\/\//i.test(url)) return false;
@@ -4732,9 +4748,9 @@ function _assistantTurnBlocks(turn){
 }
 function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
-  return open
-    ? `<div class="thinking-card open"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`
-    : `<div class="thinking-card"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
+  const classes=`thinking-card${open?' open':''}`;
+  return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
@@ -7040,7 +7056,7 @@ function finalizeThinkingCard(){
       const summary=group.querySelector('.tool-call-group-summary');
       if(summary) summary.setAttribute('aria-expanded','false');
     }
-    const active=group.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+    const active=turn.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
     if(active) active.removeAttribute('data-thinking-active');
     _syncToolCallGroupSummary(group);
   }
@@ -7095,6 +7111,11 @@ function appendThinking(text='', options){
   }
   const thinkingText=String(text||'').trim()||'Thinking…';
   let row=blocks.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+  if(!row){
+    const thinkingCards=Array.from(blocks.querySelectorAll('.agent-activity-thinking'));
+    row=thinkingCards.filter(el=>el.closest('.assistant-turn-blocks')===blocks).pop()||null;
+    if(row) row.setAttribute('data-thinking-active','1');
+  }
   if(!row){
     row=_thinkingActivityNode(thinkingText, false);
     row.setAttribute('data-thinking-active','1');

@@ -3,9 +3,9 @@
 Mirrors the structure of test_1003_appearance_autosave.py to verify the
 preferences-panel autosave pattern is wired correctly:
 
-- All 13 preference fields use _schedulePreferencesAutosave (not _markSettingsDirty)
+- All 15 preference fields use _schedulePreferencesAutosave (not _markSettingsDirty)
 - Password field MUST still call _markSettingsDirty (security: never autosave)
-- _preferencesPayloadFromUi covers all 13 fields
+- _preferencesPayloadFromUi covers all 14 fields
 - _setPreferencesAutosaveStatus uses the shared i18n keys
 - Status div exists in static/index.html
 - _autosavePreferencesSettings clears the dirty flag and hides the unsaved bar
@@ -38,8 +38,10 @@ PREFERENCE_FIELDS_AUTOSAVE = [
     ("settingsSendKey", "send_key"),
     ("settingsLanguage", "language"),
     ("settingsShowTokenUsage", "show_token_usage"),
+    ("settingsShowTps", "show_tps"),
     ("settingsSimplifiedToolCalling", "simplified_tool_calling"),
     ("settingsShowCliSessions", "show_cli_sessions"),
+    ("settingsShowPreviousMessagingSessions", "show_previous_messaging_sessions"),
     ("settingsSyncInsights", "sync_to_insights"),
     ("settingsCheckUpdates", "check_for_updates"),
     ("settingsSoundEnabled", "sound_enabled"),
@@ -51,8 +53,8 @@ PREFERENCE_FIELDS_AUTOSAVE = [
 ]
 
 
-def test_all_13_preference_fields_have_autosave_payload_entries():
-    """_preferencesPayloadFromUi must include all 13 preference fields."""
+def test_all_15_preference_fields_have_autosave_payload_entries():
+    """_preferencesPayloadFromUi must include all 15 preference fields."""
     block = _function_block(PANELS_JS, "_preferencesPayloadFromUi")
     for dom_id, field in PREFERENCE_FIELDS_AUTOSAVE:
         assert f"$('{dom_id}')" in block, \
@@ -62,7 +64,7 @@ def test_all_13_preference_fields_have_autosave_payload_entries():
 
 
 def test_preference_fields_use_schedule_autosave_not_mark_dirty():
-    """All 12 listener attachments (excluding bot_name's debounce wrapper) must
+    """All 14 listener attachments (excluding bot_name's debounce wrapper) must
     use _schedulePreferencesAutosave. bot_name uses a wrapper but still
     eventually calls _schedulePreferencesAutosave."""
     panel = _load_settings_panel_block()
@@ -105,12 +107,29 @@ def test_password_still_uses_mark_dirty():
 
 def test_autosave_clears_dirty_flag_and_hides_unsaved_bar():
     """_autosavePreferencesSettings must clear the dirty flag and hide the
-    unsaved-changes bar on success — otherwise the bar shows stale state."""
+    unsaved-changes bar on success — but ONLY when password and model are
+    not pending. Q1 from Opus pre-release review of v0.50.250."""
     block = _function_block(PANELS_JS, "_autosavePreferencesSettings")
-    assert "_settingsDirty=false" in block.replace(" ", ""), \
-        "_autosavePreferencesSettings must set _settingsDirty=false on success"
-    assert "settingsUnsavedBar" in block, \
-        "_autosavePreferencesSettings must hide settingsUnsavedBar on success"
+    # Must check pwField/modelSel state before clearing dirty + hiding bar
+    assert "settingsPassword" in block, (
+        "_autosavePreferencesSettings must check the password field before "
+        "clearing _settingsDirty (Opus SHOULD-FIX Q1: autosave was clobbering "
+        "pending password edits)"
+    )
+    assert "settingsModel" in block, (
+        "_autosavePreferencesSettings must check the model selector before "
+        "clearing _settingsDirty (autosave was clobbering pending model changes)"
+    )
+    assert "_settingsHermesDefaultModelOnOpen" in block, (
+        "_autosavePreferencesSettings must compare the model selector value "
+        "against the on-open snapshot to detect a pending change"
+    )
+    # The clear-and-hide block must be conditional, not unconditional
+    compact = block.replace(" ", "").replace("\n", "")
+    assert "if(!pwDirty&&!modelDirty)" in compact or "if(pwDirty||modelDirty)" in compact, (
+        "_autosavePreferencesSettings must guard the dirty-clear and bar-hide "
+        "with a condition that defers when a manual field has pending edits"
+    )
 
 
 def test_status_div_exists_in_index_html():

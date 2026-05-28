@@ -1,5 +1,8 @@
 async function api(path,opts={}){
-  // Strip leading slash so URL resolves relative to location.href (supports subpath mounts)
+  // Strip leading slash so URL resolves relative to the app base (supports subpath mounts and /session/<id> deep links).
+  // Use document.baseURI (set by the <base> tag in index.html) so that when location.href is
+  // /session/<id>, relative paths like "api/chat/start" still resolve to /api/chat/start and
+  // not /session/api/chat/start.
   const rel = path.startsWith('/') ? path.slice(1) : path;
   const url=new URL(rel,document.baseURI||location.href);
   const timeoutMs=Object.prototype.hasOwnProperty.call(opts,'timeoutMs')?opts.timeoutMs:30000;

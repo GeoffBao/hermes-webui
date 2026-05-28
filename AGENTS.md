@@ -78,3 +78,13 @@ python3 bootstrap.py
 
 Do not include private machine instructions in this tracked file. Use a
 git-ignored local note for personal workflow details.
+
+## Learned User Preferences
+
+- When `git push origin master` is rejected as non-fast-forward after local upstream work, prefer pushing to a named feature branch over force-pushing `master` unless explicitly asked otherwise.
+
+## Learned Workspace Facts
+
+- Nesquena source uses git remote `upstream`; this fork pushes to `origin`. Requests to update a "stream" branch usually mean syncing `upstream/master`, not a generic `stream` remote branch unless explicitly named.
+- Merging `upstream/master` with `-X ours` (or resolving all conflicts with `--ours`) keeps local conflict hunks but can leave non-conflicting files inconsistent across modules; if the server or pytest live fixtures fail, check import/route mismatches (for example `server.py` vs `api/routes.py`) before assuming a UI-only regression.
+- Fork chat image avatars live in `static/hermes-agent-avatar.png` and `static/user-avatar.png` with wiring in `static/ui.js` and `static/style.css`; upstream merges may drop JS/CSS while assets and `tests/test_assistant_avatar.py` remain—re-run that test after large static merges.

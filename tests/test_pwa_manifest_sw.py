@@ -2,7 +2,7 @@
 
 Covers:
 - manifest.json is valid JSON with required PWA fields
-- sw.js has the `__CACHE_VERSION__` placeholder the server replaces at request time
+- sw.js has the `__WEBUI_VERSION__` placeholder the server replaces at request time
 - sw.js offline-fallback uses a resolved promise (not `caches.match() || fallback`
   which is broken — Promise objects are always truthy in `||` checks, so the
   fallback Response would never be used)
@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "static" / "manifest.json"
 SW = ROOT / "static" / "sw.js"
+PWA_STARTUP = ROOT / "static" / "pwa-startup.js"
+BOOT = ROOT / "static" / "boot.js"
 INDEX = ROOT / "static" / "index.html"
 ROUTES = ROOT / "api" / "routes.py"
 AUTH = ROOT / "api" / "auth.py"
@@ -53,10 +55,29 @@ class TestManifest:
 class TestServiceWorker:
     def test_sw_has_cache_version_placeholder(self):
         src = SW.read_text(encoding="utf-8")
-        assert "__CACHE_VERSION__" in src, (
-            "sw.js must contain __CACHE_VERSION__ placeholder for the server "
+        assert "__WEBUI_VERSION__" in src, (
+            "sw.js must contain __WEBUI_VERSION__ placeholder for the server "
             "handler at /sw.js to replace with WEBUI_VERSION at request time"
         )
+
+    def test_sw_js_has_no_merge_conflict_markers(self):
+        """Regression guard for v0.50.279 stage build: a leftover git conflict
+        marker in static/sw.js made the file fail to parse as JavaScript even
+        though the substring-based source-string tests still passed (the
+        ``__WEBUI_VERSION__`` token was present, just inside the conflict block).
+
+        A broken sw.js means the install handler throws on script load → SW
+        never reaches activated state → old SW keeps controlling the page →
+        every "old SW deletes other caches" guarantee is forfeited and frontend
+        cache-bust pathways silently break. Caught by Opus advisor pre-merge,
+        ship blocked. This test would have caught it too.
+        """
+        src = SW.read_text(encoding="utf-8")
+        for marker in ("<<<<<<<", "=======\n", ">>>>>>>"):
+            assert marker not in src, (
+                f"static/sw.js contains conflict marker {marker!r}; "
+                "the merge resolution did not actually land. Reject ship."
+            )
 
     def test_sw_bypasses_api_and_stream(self):
         src = SW.read_text(encoding="utf-8")
@@ -98,7 +119,7 @@ class TestServiceWorker:
         """
         src = SW.read_text(encoding="utf-8")
         assert "Shell assets: network-first with cache fallback" in src
-        assert "fetch(event.request).then((response)" in src
+        assert "fetch(new Request(event.request, { cache: 'no-store' })).then((response)" in src
         assert "caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone))" in src
         assert ".catch(() => caches.match(event.request)" in src
         assert "if (cached) return cached;" not in src, (
@@ -142,8 +163,8 @@ class TestPWARoutes:
         idx = src.find('"/sw.js"')
         assert idx != -1, "routes.py must handle /sw.js"
         block = src[idx:idx + 1000]
-        assert "__CACHE_VERSION__" in block, (
-            "sw.js route must replace __CACHE_VERSION__ with the current WEBUI_VERSION"
+        assert "__WEBUI_VERSION__" in block, (
+            "sw.js route must replace __WEBUI_VERSION__ with the current WEBUI_VERSION"
         )
         assert "WEBUI_VERSION" in block, (
             "sw.js route must import and use WEBUI_VERSION for cache busting"
@@ -194,14 +215,167 @@ class TestIndexHtmlIntegration:
         assert "sw.js?v=__WEBUI_VERSION__" in src
         assert "static/ui.js?v=__WEBUI_VERSION__" in src
 
+    def test_index_versions_stylesheet(self):
+        """Regression for #1507: the `<link rel=stylesheet>` for style.css MUST
+        carry the same `?v=__WEBUI_VERSION__` cache-bust query as the JS files.
+
+        Without the version, a stale service worker controlling a tab across a
+        version upgrade would intercept `static/style.css`, find an exact URL
+        match in its old shell cache, and return OLD CSS — while the new JS
+        URLs (which DO carry `?v=`) miss the cache and load fresh. The mismatch
+        breaks the layout until a force-refresh bypasses the SW.
+        """
+        src = INDEX.read_text(encoding="utf-8")
+        assert "static/style.css?v=__WEBUI_VERSION__" in src, (
+            "static/style.css must carry ?v=__WEBUI_VERSION__ so an old service "
+            "worker controlling the tab across a version upgrade does not return "
+            "stale CSS — see #1507"
+        )
+        # And the unversioned form must NOT appear (defensive — catches accidental
+        # reverts that leave both lines).
+        assert 'href="static/style.css"' not in src, (
+            "unversioned static/style.css link found — must include "
+            "?v=__WEBUI_VERSION__ for cache busting"
+        )
+
+    def test_sw_shell_assets_match_versioned_asset_urls(self):
+        """The service worker's SHELL_ASSETS pre-cache list must use the same
+        `?v=__WEBUI_VERSION__` suffix on JS+CSS that index.html sends, so that
+        the pre-cached entries actually serve when the page requests them.
+
+        Without this, every `cache.match()` for a versioned asset URL (e.g.
+        `static/style.css?v=vN`) would miss against the unversioned pre-cached
+        entry (`static/style.css`), defeating the pre-cache.
+        """
+        src = SW.read_text(encoding="utf-8")
+        # Versioned shell assets must include the cache version query.
+        for asset in (
+            "style.css",
+            "boot.js",
+            "ui.js",
+            "messages.js",
+            "sessions.js",
+            "panels.js",
+            "commands.js",
+            "icons.js",
+            "i18n.js",
+            "workspace.js",
+            "terminal.js",
+            "onboarding.js",
+        ):
+            # Either inline `?v=__WEBUI_VERSION__` or via the VQ constant
+            # produces a URL string the cache lookup can match.
+            has_inline = f"{asset}?v=__WEBUI_VERSION__" in src
+            has_concat = f"{asset}' + VQ" in src or f"{asset}\" + VQ" in src
+            assert has_inline or has_concat, (
+                f"sw.js SHELL_ASSETS entry for {asset} must carry "
+                "?v=__WEBUI_VERSION__ to match the URL the page requests"
+            )
+
+    def test_sw_shell_assets_are_network_first(self):
+        """Shell JS/CSS must prefer the network, then fall back to CacheStorage.
+
+        Cache-first with an unchanged local dev version can keep stale boot.js
+        loaded after a hotfix, which is exactly how browser chrome/theme-color
+        regressions survive a patch until someone performs cache exorcism.
+        """
+        src = SW.read_text(encoding="utf-8")
+        marker = "// Shell assets: network-first with cache fallback"
+        assert marker in src
+        block = src[src.find(marker):src.find(marker) + 900]
+        assert "fetch(new Request(event.request, { cache: 'no-store' })).then" in block
+        assert "caches.match(event.request)" in block
+        assert "caches.match(event.request).then((cached)" not in block[:250]
+
+    def test_index_loads_pwa_startup_helper_early(self):
+        """The installed-app shell should classify standalone/offline mode before
+        the main UI bundle hydrates, so native chrome and safe-area affordances
+        are present on first paint.
+        """
+        src = INDEX.read_text(encoding="utf-8")
+        preload_pos = src.find('href="static/pwa-startup.js?v=__WEBUI_VERSION__"')
+        script_pos = src.find('src="static/pwa-startup.js?v=__WEBUI_VERSION__"')
+        ui_pos = src.find('static/ui.js?v=__WEBUI_VERSION__')
+        assert preload_pos != -1, "index.html must preload the PWA startup helper"
+        assert script_pos != -1, "index.html must load the PWA startup helper"
+        assert ui_pos != -1, "index.html must load the main UI bundle"
+        assert preload_pos < ui_pos and script_pos < ui_pos, (
+            "pwa-startup.js must run before ui.js so standalone/offline classes "
+            "are available before the app shell paints"
+        )
+
+    def test_sw_precaches_pwa_startup_helper(self):
+        src = SW.read_text(encoding="utf-8")
+        assert "pwa-startup.js' + VQ" in src or 'pwa-startup.js" + VQ' in src, (
+            "sw.js SHELL_ASSETS must pre-cache pwa-startup.js with the same "
+            "version query used by index.html"
+        )
+
+    def test_manifest_has_native_launch_fields(self):
+        data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        assert data.get("id") == "./"
+        assert data.get("scope") == "./"
+        assert data.get("start_url") == "./?source=pwa"
+        assert "standalone" in data.get("display_override", []), (
+            "manifest.display_override should preserve standalone as a native "
+            "launch fallback"
+        )
+        shortcuts = data.get("shortcuts") or []
+        assert any(shortcut.get("url") == "./?source=pwa&action=new-chat" for shortcut in shortcuts), (
+            "manifest should expose a native shortcut for starting a new chat"
+        )
+
+    def test_pwa_startup_detects_standalone_and_install_events(self):
+        src = PWA_STARTUP.read_text(encoding="utf-8")
+        assert "pwa-standalone" in src
+        assert "pwa-browser" in src
+        assert "beforeinstallprompt" in src
+        assert "appinstalled" in src
+        assert "HermesPWA" in src
+        assert "launchAction" in src
+        assert "promptInstall" in src
+
+    def test_pwa_new_chat_shortcut_is_handled_at_boot(self):
+        src = BOOT.read_text(encoding="utf-8")
+        assert "pwaLaunchAction" in src
+        assert "launchAction()" in src
+        assert "pwaLaunchAction==='new-chat'" in src
+        assert "await newSession(true)" in src
+
     def test_index_route_url_encodes_asset_version(self):
         src = ROUTES.read_text(encoding="utf-8")
         idx = src.find('parsed.path in ("/", "/index.html")')
-        assert idx != -1, "routes.py must handle / and /index.html"
+        if idx == -1:
+            idx = src.find('parsed.path.startswith("/session/")')
+        assert idx != -1, "routes.py must handle /, /index.html, and /session/<id>"
         block = src[idx:idx + 800]
         assert "quote(WEBUI_VERSION, safe=\"\")" in block, (
             "index route must URL-encode the cache-busting version token before "
             "injecting it into script src attributes and service worker registration"
+        )
+
+    def test_index_sw_registration_uses_relative_path(self):
+        """Regression: service worker registration MUST stay relative (no leading slash).
+
+        index.html sets a dynamic <base href> via script at the top of <head>.
+        All static asset paths must be relative so that installs behind a reverse
+        proxy at a subpath (e.g. /hermes/) resolve correctly.
+
+        An absolute '/sw.js' breaks subpath mounts because the browser requests
+        <origin>/sw.js — outside the proxy mount root.  A relative 'sw.js'
+        resolves to <origin><base>/sw.js, which is correct for both root and
+        subpath installs.  See issue #1481 review feedback.
+        """
+        src = INDEX.read_text(encoding="utf-8")
+        # Must contain the relative form
+        assert "'sw.js?v=" in src, (
+            "serviceWorker.register() must use relative 'sw.js' path, "
+            "not absolute '/sw.js' — subpath mounts depend on <base href> resolution"
+        )
+        # Must NOT contain the absolute form
+        assert "'/sw.js?v=" not in src, (
+            "serviceWorker.register() must NOT use absolute '/sw.js' path — "
+            "this breaks installs behind a reverse proxy at a subpath"
         )
 
     def test_index_has_ios_pwa_meta_tags(self):

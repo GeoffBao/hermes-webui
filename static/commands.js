@@ -664,7 +664,7 @@ async function cmdUsage(){
 
 async function cmdTheme(args){
   const themes=['system','dark','light'];
-  const skins=(_SKINS||[]).map(s=>s.name.toLowerCase());
+  const skins=(_SKINS||[]).map(s=>(s.value||s.name).toLowerCase());
   const legacyThemes=Object.keys(_LEGACY_THEME_MAP||{});
   const val=(args||'').toLowerCase().trim();
   // Check if it's a theme
@@ -1141,7 +1141,8 @@ function cmdReasoning(args){
   }
   if(!arg){
     // Status — read from the same config.yaml keys the CLI uses.
-    api('/api/reasoning').then(function(st){showToast(_fmtStatus(st));})
+    const q=(typeof _reasoningEffortQuery==='function')?_reasoningEffortQuery():'';
+    api('/api/reasoning'+q).then(function(st){showToast(_fmtStatus(st));})
       .catch(function(){showToast(BRAIN+' /reasoning — status unavailable');});
     return true;
   }
@@ -1168,7 +1169,7 @@ function cmdReasoning(args){
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
         showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
-        if(typeof _applyReasoningChip==='function') _applyReasoningChip(eff);
+        if(typeof _applyReasoningChip==='function') _applyReasoningChip(eff, st||{});
       })
       .catch(function(e){
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
